@@ -15,8 +15,9 @@ See Anthropic's [skills documentation](https://docs.claude.com/en/docs/claude-co
 | Skill | What it does |
 |---|---|
 | [`eezstudio/`](eezstudio/SKILL.md) | Author and debug [EEZ Studio](https://www.envox.eu/studio/studio-introduction/) LVGL projects (`.eez-project` JSON files) programmatically. Covers measuring widget geometry against real TTF fonts, bisecting silently-failing project files, and the EEZ Studio → `idf.py build` handoff for ESP32 / LVGL firmware. |
+| [`freecad/`](freecad/SKILL.md) | Drive [FreeCAD](https://www.freecad.org/) over an MCP server to build parametric PartDesign models, `App::Link` assemblies, and CAM (Path) jobs. Covers the failure modes that report success while producing nothing — inert CAM jobs, empty DXF exports, pockets that cut air, and modelled dogbones that never survive the toolpath offset. |
 
-More skills will be added as we extract them — pinout diagram generation, KiCad library tooling, FreeCAD automation, CAD-to-photo rendering, and others currently live in our internal toolbox.
+More skills will be added as we extract them — pinout diagram generation, KiCad library tooling, CAD-to-photo rendering, and others currently live in our internal toolbox.
 
 ## Using a skill
 
