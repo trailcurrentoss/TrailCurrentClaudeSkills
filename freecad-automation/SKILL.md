@@ -1,5 +1,5 @@
 ---
-name: freecad
+name: freecad-automation
 description: Create, modify, inspect, and export FreeCAD 3D CAD models and CAM (Path) jobs by driving a running FreeCAD instance through the `freecad` MCP server. Use whenever a task touches a `.FCStd` file, a PartDesign body/sketch/pad/pocket, a datum plane, an `App::Link` assembly, a spreadsheet-driven parametric model, a STEP/STL/DXF/glTF export, or a CAM job, toolpath, dressup, or posted G-code. Build with PartDesign, never Part booleans; keep every `execute_code` call under ~2 s, because it runs on FreeCAD's GUI thread and a slow call freezes the user's application. Covers the failure modes that present as something else entirely: a modal dialog deadlocking every later call, a blank screenshot caused by a hidden Body Tip, several documents bound to one file so fixes appear to revert, ghost sketches drawn once per link, spreadsheets that drive nothing, pockets that silently cut air, CAM jobs built at the App layer that are inert in the GUI, and modelled dogbones that never survive the toolpath offset.
 ---
 
@@ -9,21 +9,11 @@ Create and modify 3D CAD models, generate exports, and automate FreeCAD operatio
 
 ## Instructions
 
-You are automating FreeCAD operations. This skill targets **FreeCAD 1.1 or later**.
+You are automating FreeCAD operations. This skill targets **FreeCAD 1.1 or later**, invoked as `$FREECAD_BIN`.
 
-**Never hardcode the path to the FreeCAD binary.** Resolve it in this order:
+**Never hardcode the path to the FreeCAD binary.** Resolve it in this order: ask the user and offer to save the answer to a gitignored local config; accept it as a parameter; read `$FREECAD_BIN` from the environment; otherwise fail with a message naming all three. Never fall back to a default that happens to be one developer's install.
 
-1. **Ask the user** where FreeCAD is installed, and offer to save the answer to a
-   gitignored local config file.
-2. **Accept it as a parameter** when prompting is impossible (CI, cron, non-interactive
-   shell).
-3. **Read `$FREECAD_BIN`** from the environment.
-4. **Fail with a message naming all three.** Never fall back to a default that happens
-   to be one developer's install.
-
-Which install the user has matters. A snap or flatpak FreeCAD is **sandboxed** and
-cannot read `/tmp` or paths outside the user's home; an AppImage or distro package can.
-Confirm before relying on any file path in an export or import.
+Which install the user has matters. A snap or flatpak build is **sandboxed** and cannot read `/tmp` or paths outside the user's home; an AppImage or distro package can.
 
 ### MCP Server (Primary Method — ALWAYS try first)
 
@@ -47,10 +37,10 @@ Only use headless scripting if the user explicitly says FreeCAD is unavailable o
 
 ```bash
 # Run a Python script headlessly
-"$FREECAD_BIN" -c "exec(open('/tmp/script.py').read())"
+$FREECAD_BIN -c "exec(open('/tmp/script.py').read())"
 
 # Run inline Python
-"$FREECAD_BIN" -c "import FreeCAD; print(FreeCAD.Version())"
+$FREECAD_BIN -c "import FreeCAD; print(FreeCAD.Version())"
 ```
 
 Note: Headless mode has no GUI — `FreeCADGui`/`Gui` is unavailable, so no screenshots or selection queries.
@@ -897,7 +887,7 @@ doc.removeObject("ExtractedFaces")
 
 **Alternative (usually better):** Don't extract at all. If the containing object is already in Blender at the correct world position, add the target material as a second slot on the existing mesh and use the Blender side's `mesh.polygons[i].material_index` to reassign individual faces by their world-space bounding box. See the `/blender-automation` skill for the recipe.
 
-**Blender cannot read `/tmp`** when installed as snap/flatpak. Always `cp` exported files somewhere under `$HOME` before Blender imports them.
+**Blender cannot read `/tmp`** when installed as snap/flatpak. Always `cp` exported files to `$SANDBOX_STAGE_DIR/` before Blender imports them.
 
 ---
 
@@ -943,8 +933,8 @@ Mesh.export([doc.getObject("Enclosure")], "output.stl")
 ```python
 import FreeCAD, Part, glob, os
 
-input_dir = "Product/<ProductName>/CAD/"
-output_dir = "Product/<ProductName>/CAD/exports/"
+input_dir = "Product/TrailCurrentAmpline/CAD/"
+output_dir = "Product/TrailCurrentAmpline/CAD/exports/"
 os.makedirs(output_dir, exist_ok=True)
 
 for fcstd in glob.glob(os.path.join(input_dir, "*.FCStd")):
@@ -966,7 +956,7 @@ for fcstd in glob.glob(os.path.join(input_dir, "*.FCStd")):
 - **Connector housings**: Custom connector shells for CAN bus, power
 - **Trade show display parts**: Product holder stands, demo fixtures
 
-## Example file placement convention (adapt to your own repo layout)
+## File Placement
 
 - Product-specific CAD files → `Product/<ProductName>/CAD/`
 - 3D printable items → `Print/Packaging/` or `Print/BusinessCards/`

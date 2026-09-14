@@ -1,5 +1,5 @@
 ---
-name: blender
+name: blender-automation
 description: Drive Blender through the `blender` MCP server (or its raw socket on `localhost:9876`) to build product renders, material and lighting rigs, and multi-stage assembly animations from CAD. Use whenever a task involves Blender, a `.blend` scene, importing CAD geometry into Blender, rendering a product still or turntable, configuring Cycles or EEVEE, or encoding rendered frames to MP4/WebM. Import CAD as glTF, never STL — STL collapses the whole assembly into one grey material. Never call `bpy.ops.render.render()` for an animation through `execute_code`; it blocks Blender's UI thread. Covers the traps that silently cost hours: `read_factory_settings` tearing down the MCP socket, a sandboxed Blender refusing to read `/tmp`, the parent-child double-translation bug, `hide_render` not cascading to mesh children, FreeCAD's glTF exporter writing every material as metallic=1, matte black rendering as mid-grey under Filmic, and long-animation render timeouts that are purely cosmetic because the render completes anyway.
 ---
 
@@ -18,7 +18,7 @@ a code snippet you save.**
 
 | Name | What it is |
 |---|---|
-| `BLENDER_WORK_DIR` | A directory Blender can definitely read and write. Must **not** be `/tmp` if Blender is a snap or flatpak — those are sandboxed and cannot see it. |
+| `SANDBOX_STAGE_DIR` | A directory Blender can definitely read and write. Must **not** be `/tmp` if Blender is a snap or flatpak — those are sandboxed and cannot see it. |
 | `PROJECT_ROOT` | Root of the asset/product repository that renders and CAD files live under. |
 
 Resolve each in this order:
@@ -36,7 +36,7 @@ launched from a desktop launcher and has none of your shell variables. So:
 ```python
 # host side (Bash, or the Python that talks to the socket) — env works
 import os
-WORK = os.environ["BLENDER_WORK_DIR"]
+WORK = os.environ["SANDBOX_STAGE_DIR"]
 PROJECT_ROOT = os.environ["PROJECT_ROOT"]
 
 # Blender side — substitute the resolved path INTO the code string you send
@@ -238,7 +238,7 @@ while True:
 
 ### Environment Constraints
 
-- **Install method decides what Blender can read.** A snap or flatpak Blender is **sandboxed** and cannot access `/tmp`. Every path you hand it must be under `$BLENDER_WORK_DIR`. If render output appears "not to write," it is almost certainly landing in the sandbox's private tmp (`$XDG_RUNTIME_DIR/.flatpak/org.blender.Blender/tmp/`) rather than where you asked — write to `$BLENDER_WORK_DIR` instead. A distro package or the official tarball has no such restriction.
+- **Install method decides what Blender can read.** A snap or flatpak Blender is **sandboxed** and cannot access `/tmp`. Every path you hand it must be under `$SANDBOX_STAGE_DIR`. If render output appears "not to write," it is almost certainly landing in the sandbox's private tmp (`$XDG_RUNTIME_DIR/.flatpak/org.blender.Blender/tmp/`) rather than where you asked — write to `$SANDBOX_STAGE_DIR` instead. A distro package or the official tarball has no such restriction.
 - **GPU: query it, do not assume it.** Call `cprefs.get_devices()` and print each device's `name` and `type`. Backend by vendor: `OPTIX` or `CUDA` on NVIDIA, `HIP` on AMD, `METAL` on Apple silicon, `ONEAPI` on Intel Arc. Timings quoted in this skill were measured on an 8 GB NVIDIA laptop GPU — scale expectations to the hardware actually present.
 - **STL import:** Uses `bpy.ops.wm.stl_import()` in Blender 5.x (not `bpy.ops.import_mesh.stl()`).
 - **Render engine names:** `CYCLES`, `BLENDER_EEVEE`, `BLENDER_WORKBENCH`.
@@ -497,7 +497,7 @@ Product assembly animations show how parts fit together — board into housing, 
 
 1. **NEVER call `bpy.ops.wm.read_factory_settings(use_empty=True)`.** It tears down the BlenderMCP addon socket and you lose the MCP connection. To clear the scene, iterate `bpy.data.objects`, `bpy.data.materials`, `bpy.data.meshes` and remove entries manually.
 
-2. **Snap/flatpak sandboxes can't read `/tmp`.** Stage all glTF files under `$BLENDER_WORK_DIR` before importing. FreeCAD writes `/tmp` fine, so the pattern is: `ImportGui.export(..., "/tmp/x.glb")` → `cp /tmp/x.glb "$BLENDER_WORK_DIR/"` → `bpy.ops.import_scene.gltf(filepath=f"{WORK}/x.glb")`.
+2. **Snap/flatpak sandboxes can't read `/tmp`.** Stage all glTF files under `$SANDBOX_STAGE_DIR` before importing. FreeCAD writes `/tmp` fine, so the pattern is: `ImportGui.export(..., "/tmp/x.glb")` → `cp /tmp/x.glb "$SANDBOX_STAGE_DIR/"` → `bpy.ops.import_scene.gltf(filepath=f"{WORK}/x.glb")`.
 
 3. **Parent-child double-translation bug.** After `parent.location = world_pos`, call `bpy.context.view_layer.update()` before computing `matrix_parent_inverse`. AND zero out the child's local transform after parenting. The only reliable recipe:
    ```python
@@ -568,15 +568,15 @@ bpy.ops.render.render(animation=True)
 
 ```bash
 # ffmpeg side (separate Bash call after render completes)
-cd "$BLENDER_WORK_DIR/product_anim_frames"
+cd "$SANDBOX_STAGE_DIR/product_anim_frames"
 ffmpeg -y -framerate 30 -i frame_%04d.png \
   -c:v libx264 -pix_fmt yuv420p -crf 20 -preset medium -movflags +faststart \
-  "$BLENDER_WORK_DIR/product-assembly.mp4"
+  "$SANDBOX_STAGE_DIR/product-assembly.mp4"
 ffmpeg -y -framerate 30 -i frame_%04d.png \
   -c:v libvpx-vp9 -pix_fmt yuv420p -b:v 0 -crf 32 -row-mt 1 -threads 4 \
-  "$BLENDER_WORK_DIR/product-assembly.webm"
-convert "$BLENDER_WORK_DIR/product_anim_frames/frame_0740.png" -quality 85 \
-  "$BLENDER_WORK_DIR/product-assembly-poster.jpg"
+  "$SANDBOX_STAGE_DIR/product-assembly.webm"
+convert "$SANDBOX_STAGE_DIR/product_anim_frames/frame_0740.png" -quality 85 \
+  "$SANDBOX_STAGE_DIR/product-assembly-poster.jpg"
 ```
 
 HTML markup uses a `<video autoplay muted loop playsinline preload="metadata">` block with WebM + MP4 sources and a hero PNG fallback — see `headwaters.html` / `reservoir.html` in the TrailCurrent website for the pattern.
