@@ -1,6 +1,6 @@
 ---
 name: eezstudio
-description: Help the user build EEZ Studio LVGL projects by editing the `.eez-project` JSON directly via Python scripts in the project's `tmp/` directory. The agent makes the changes; the user opens EEZ Studio to **visually validate** them before flashing, and retains the option to make additional changes themselves. The skill's central concern is canvas-device divergence — the bug where deployed firmware shows graphical elements that don't appear in EEZ Studio's canvas. Two mechanisms cause it: (1) C code in `main/*.c` calling `lv_obj_set_pos` / `_size` / `_align` etc. on `objects.<widget>` (Mode A), and (2) JSON shapes the C generator accepts but EEZ's canvas renderer silently drops (Mode B). Every edit runs the verifier gates that catch both. Use this skill for any task involving screens, widgets, styles, fonts, themes, or actions in an EEZ Studio LVGL project. Includes Trap reference, schema crib sheet (with pointers into the EEZ Studio source at github.com/eez-open/studio), and C-side wiring conventions for `actions.c` / `vars.c` / `main/main.c`.
+description: Help the user build EEZ Studio LVGL projects by editing the `.eez-project` JSON directly via Python scripts in the project's `tmp/` directory. The agent makes the changes; the user opens EEZ Studio to **visually validate** them before flashing, and retains the option to make additional changes themselves. The skill's central concern is canvas-device divergence — the bug where deployed firmware shows graphical elements that don't appear in EEZ Studio's canvas. Two mechanisms cause it: (1) C code in `main/*.c` calling `lv_obj_set_pos` / `_size` / `_align` etc. on `objects.<widget>` (Mode A), and (2) JSON shapes the C generator accepts but EEZ's canvas renderer silently drops (Mode B). Every edit runs the verifier gates that catch both. Use this skill for any task involving screens, widgets, styles, fonts, themes, or actions in an EEZ Studio LVGL project. Also covers the Docker full simulator (0.26+) — which compiles your own C, and so constrains where hand-written files may live and forbids ESP-IDF headers in the export folder — plus LVGL 9 specifics (Scale parts, Spangroup, grid layout) and driving `ui_tick()` on the device. Includes Trap reference, schema crib sheet (with pointers into the EEZ Studio source at github.com/eez-open/studio), and C-side wiring conventions for `actions.c` / `vars.c` / `main/main.c`.
 ---
 
 # EEZ Studio (programmatic `.eez-project` authoring)
@@ -16,6 +16,7 @@ The clean separation is:
 >
 > | Variable | What it points at |
 > |---|---|
+> | `$FONT_DIR` | directory holding the brand OTF/TTF files |
 > | `$PROJECT_ROOT` | root of the product/asset repository |
 >
 > Resolve each from the environment; if unset, ask the user and offer to save
@@ -120,6 +121,8 @@ After running the script and writing the modified JSON back, run all five and ro
 - **G3 — Named-reference integrity:** `python3 ~/.claude/skills/eezstudio/verify_project.py <project>.eez-project` exits zero. No dangling `useStyle`, `text_font`, `text_color`, `action`, `userWidgetPageName`, `image` references.
 - **G4 — Action set:** count of `actions[]` matches expected (existing + new). The script should print which actions it added.
 - **G5 — No canvas-device divergence:** `python3 ~/.claude/skills/eezstudio/verify_no_canvas_divergence.py <project_root>` exits zero. No `lv_obj_set_pos`/`_size`/`_align`/etc. on `objects.<widget>` in any `main/*.c`. Critical because Mode-A overrides are the easy bug to introduce when wiring C after the JSON edit.
+- **G6 — Generator audits:** the two checks the shipped verifiers do NOT perform, run from the generator so it refuses to write a bad project: `audit_style_widget_types()` (Trap 24 — `forWidgetType` mismatch, which only EEZ Studio's Check panel would otherwise report) and `audit_span_colors()` (Trap 28 — a span `textColor` that breaks `screens.c`). Both are in this skill; copy them into any project generator.
+- **G7 — Simulator still builds** (any project with a full-simulator setup): run the local proxy check (`tmp/check_sim_build.sh`, in the full-simulator section). It takes about a second and catches the two recurring breakages — an ESP-IDF header inside the export folder, and a standard header the device build supplied transitively (Trap 27). **Run this before every handoff, not only after touching the export folder**, because the failure is caused by what C calls, not by which file was last edited. A device build passing tells you nothing about the simulator.
 
 Gate failures roll back from the backup the script took at step 1. Don't try to "fix forward" a broken JSON — the backup is the rollback point.
 
@@ -485,7 +488,102 @@ typedef int actions_placeholder;     /* keeps the TU non-empty */
 
 Use the same guard in `main.c` around `ui_init()` and show a "run EEZ Studio Build" placeholder label on the screen when the export hasn't happened yet.
 
+## The full simulator (Docker) — what it compiles, and what that constrains
+
+EEZ Studio 0.26+ has a **full simulator**: enable Docker Desktop in Settings, press Build, and the project is compiled to WebAssembly inside a container and run in a window. Unlike the old Run button — which draws the screens and stubs everything behind them — this one **compiles and runs your own C**: your `action_*()` handlers, your `get_var_*()` accessors, and whatever sits behind them.
+
+That makes it genuinely useful, and it imposes two architectural constraints that are invisible until they break.
+
+### Constraint 1 — everything the UI references must live inside the export folder
+
+The container is fed by copying **only `settings.build.destinationFolder`** into `/project/src/`, then compiling **every `.c` it finds there** and linking with `-sLLD_REPORT_UNDEFINED`. Anything the UI references that lives elsewhere in the firmware tree is simply not present, and the link fails.
+
+So hand-written C that the UI calls into has to sit **in the export folder next to the generated files**. That looks wrong the first time you do it — the folder is otherwise EEZ Studio's output — but it is the only arrangement the simulator can build. The split that works:
+
+```
+main/UI/
+    screens.c  styles.c  images.c  ui.c  ui_font_*.c   <- generated, NEVER edit
+    actions.c  vars.c  dash_data.c                      <- hand-written, safe to edit
+    wifi_port_sim.c  broker_cfg_sim.c                   <- simulator backends
+main/
+    wifi_port_esp.c  broker_cfg_esp.c  mqtt_source.c    <- device backends, OUTSIDE
+```
+
+EEZ Studio only ever rewrites the files it generates, so hand-written files in that folder survive every export. Say so in a header comment on each one, because the folder's name invites someone to "clean it up".
+
+State the rule in the project's `CLAUDE.md`, naming the files on both sides of the line — "never edit the generated files in `main/UI/`" is only half the rule and the missing half causes real damage.
+
+### Constraint 2 — no ESP-IDF inside the export folder
+
+The container has Emscripten and LVGL. It does not have ESP-IDF. A single `#include "esp_log.h"` in `main/UI/actions.c` breaks the simulator build, and the error arrives in the Build Logs panel rather than anywhere you were looking.
+
+Two halves to the discipline:
+
+- **Device-only code lives outside the export folder**, so the simulator never even copies it. `wifi_port_esp.c` goes in `main/`, not `main/UI/`.
+- **Anything in the folder that needs a platform header guards it.** The simulator build defines `EEZ_LVGL_SIMULATOR`; use it both ways — `#ifdef` for simulator-only code, `#ifndef` for device-only — and let the unused half compile to an empty translation unit.
+
+Guarding `esp_log.h` has a second-order consequence that catches people twice: ESP-IDF headers were also supplying standard headers like `<string.h>`, and guarding them out takes those away. See **Trap 27** — include what you use in every file in this folder, and make your local check as strict as the container.
+
+The same symbol is how you feed the simulator fake readings. The pattern that works is a block under `#ifdef EEZ_LVGL_SIMULATOR` that calls **the same setters the real data path calls**, rather than a parallel implementation of the accessors:
+
+```c
+#ifdef EEZ_LVGL_SIMULATOR
+static void sim_feed(uint32_t now_ms)
+{
+    dash_data_set_battery(tri(now_ms, 24000u, 11400, 13900), ...);
+    dash_data_set_solar(tri(now_ms, 17000u, 0, 1150));
+}
+#endif
+```
+
+The UI cannot tell the difference, and the code under test is the code that ships. Drive each value on a **different period** so nothing moves in lockstep — a value box that is too narrow for its widest string is obvious when the values disagree and easy to miss when they sweep together.
+
+When asked to write the real data path, write the simulated one at the same time. It costs a few lines and it is what makes the simulator worth having.
+
+### A local proxy for the simulator build
+
+The real simulator needs Docker and a human pressing Build. This reproduces its two constraints in about a second and catches the failures that actually recur — an ESP-IDF header sneaking into the export folder, and C referencing objects or actions the current export does not declare. Keep it in the project's gitignored `tmp/` and run it before asking the user to open EEZ Studio.
+
+```bash
+#!/usr/bin/env bash
+# Proxy for the EEZ Studio full simulator build: EEZ_LVGL_SIMULATOR defined,
+# LVGL on the path, and NO ESP-IDF include paths whatsoever.
+set -u
+cd "$(dirname "$0")/../.."
+LV=managed_components/lvgl__lvgl
+
+# LV_CONF_SKIP falls back to LVGL defaults, which enable only Montserrat 14.
+# Keep this list in step with CONFIG_LV_FONT_MONTSERRAT_* in sdkconfig.defaults
+# or the check drowns in font errors that are an artifact of the proxy.
+FONT_DEFS=""
+for n in 12 14 16 20 28; do FONT_DEFS="$FONT_DEFS -DLV_FONT_MONTSERRAT_$n=1"; done
+
+fail=0
+for f in main/UI/*.c; do
+    if ! gcc -fsyntax-only -std=gnu17 \
+            -DEEZ_LVGL_SIMULATOR -DLV_CONF_SKIP -DLV_LVGL_H_INCLUDE_SIMPLE \
+            $FONT_DEFS -I main/UI -I "$LV" -I "$LV/src" "$f" 2> /tmp/err.txt; then
+        echo "FAIL  $f"; grep -E "error:" /tmp/err.txt | head -4 | sed 's/^/        /'
+        fail=1
+    fi
+done
+[ "$fail" -eq 0 ] && echo "OK: main/UI/ compiles with no ESP-IDF present"
+exit $fail
+```
+
+### What the simulator will and will not tell you
+
+It **will** catch logic that never ran before: an event handler wired to nothing, a keyboard with no textarea (Trap 26), an accessor that returns a stale pointer, a format string that overflows its buffer. These are the bugs that are expensive on hardware precisely because they look like hardware faults.
+
+It will **not** tell you anything about the board. No touch controller, no display driver, no redraw timing, no PSRAM. And it will not catch Trap 22 — the simulator's own `main.c` drives `ui_tick()` for you, so a UI that is frozen on the device sweeps perfectly here.
+
+**There are no runtime controls.** There is no panel where you type a value in to see a threshold state. In a project with `flowSupport: false` the variables belong to your C code and the editor has no view into them, so the only way to see a particular state is to write it into the simulated data and rebuild. This is an open feature request upstream, not a setting anyone is failing to find. Don't promise the user otherwise, and don't invent a "scenario switch" in the fake data unless they ask for one.
+
+The window is three panels — the running simulator, the Docker build logs, and the simulator's console output — with Build / Clean Build / Clean All in the build-log header, and Stop only while a build runs. **Read the Build Logs panel when something doesn't appear**; a failed container build leaves the previous simulator on screen, which looks exactly like a change that did nothing.
+
 ## Schema crib sheet (LVGL projects, projectVersion v3, lvglVersion 8.4.x)
+
+> **Version scope.** The shapes below were catalogued against an 8.4.x project and the common widgets are unchanged on 9.x. What does differ on 9.x: the Meter widget is gone, replaced by `LVGLScaleWidget` (Trap 23 — and it has no needle, so pair it with an Arc); `LVGLSpanWidget` exists from EEZ Studio 0.27; and the Spangroup C API changes shape between 9.2 and 9.3, which is why the project's `lvglVersion` must match the firmware's LVGL pin exactly (Trap 25). Grid layout with FR / CONTENT track sizing is available from 0.26 and is set through `layout: "GRID"` plus `grid_column_dsc_array` / `grid_row_dsc_array` in the parent's `localStyles`, with each child carrying `grid_cell_*` keys.
 
 **⭐ FIRST STOP for any "is this valid?" question: [`SCHEMA_REFERENCE.md`](./SCHEMA_REFERENCE.md) in this skill directory.**
 
@@ -512,7 +610,7 @@ The most useful files when reasoning about widget behavior (these are the SCHEMA
 
 Two side references for shape checking when you're not sure your JSON describes what you intended:
 
-- **Working production reference**: `$PROJECT_ROOT/Product/TrailCurrentFireside/GUI/TrailCurrentFireside.eez-project` — Fireside is the canonical TrailCurrent EEZ Studio project. Inspect it for the canonical shape of every widget type you need.
+- **Working production reference**: a `.eez-project` in your own tree that already renders correctly in the canvas. Inspect it for the canonical shape of every widget type you need. A public one, paired with its generated C and an ESP32 build, is at `https://github.com/trailcurrentoss/YouTubeCodeSamples` → `eez-studio-update-lvlg-9/GUI/`.
 - **Upstream simple example**: `https://github.com/eez-open/eez-project-examples` → `examples/LVGL/Smart Home Low Res.eez-project` is a minimal working file.
 
 The pattern: form a hypothesis about how a widget will behave → check Base.tsx / the specific widget's .tsx file → confirm against a working example → only then write the spec. Skipping the source-check step is what produced the keyboard bug (Trap 13) — every agent assumed `align/min/max` weren't needed in the JSON because the JSON-authored width/height "obviously" should suffice. Reading `Keyboard.tsx` makes clear it doesn't.
@@ -707,7 +805,8 @@ These have the **superset** of fields and EEZ Studio is permissive about which e
 ```
 
 Type-specific extras:
-- `LVGLLabelWidget`: `text` (string), `textType: "literal"`, `longMode: "WRAP"|"DOT"|"SCROLL"`, `recolor: false`
+- `LVGLLabelWidget`: `text` (string), `textType: "literal"|"expression"`, `longMode: "WRAP"|"DOT"|"SCROLL"|"CLIP"`, `recolor: false`, `useStaticText: true|false`
+  - `useStaticText: true` emits `lv_label_set_text_static()`, which keeps a **pointer** to the string instead of copying it into RAM. Correct and worth using for any label whose text never changes (card titles, units, headings). **Never set it on a label whose `textType` is `"expression"`** — the pointer would have to outlive every update, and the generated tick code calls the ordinary setter anyway.
 - `LVGLBarWidget`: `min`, `max`, `mode: "NORMAL"|"SYMMETRICAL"|"RANGE"`, `value`, `valueType`, `valueStart`, `valueStartType`, `enableAnimation`
 - `LVGLArcWidget`: `rangeMin`, `rangeMinType`, `rangeMax`, `rangeMaxType`, `value`, `valueType`, `bgStartAngle`, `bgEndAngle`, `mode`, `rotation`
 - `LVGLSliderWidget`: `min`, `minType`, `max`, `maxType`, `mode`, `value`, `valueType`, `previewValue`, `valueLeft`, `valueLeftType`, `previewValueLeft`, `enableAnimation`
@@ -716,6 +815,51 @@ Type-specific extras:
 - `LVGLKeyboardWidget`: `mode: "TEXT_LOWER"|"TEXT_UPPER"|"SPECIAL"|"NUMBER"`
 - `LVGLTextareaWidget`: `text`, `textType`, `placeholder`, `placeholderType`, `oneLineMode`, `passwordMode`, `acceptedCharacters`, `maxTextLength`
 - `LVGLDropdownWidget`: `options` (newline-separated), `optionsType`, `selected`, `selectedType`, `direction: "bottom"`
+- `LVGLScaleWidget` (LVGL 9 only, replaces Meter): `scaleMode: "ROUND_INNER"|"ROUND_OUTER"|"HORIZONTAL_TOP"|"HORIZONTAL_BOTTOM"|"VERTICAL_LEFT"|"VERTICAL_RIGHT"`, `minValue`, `minValueType`, `maxValue`, `maxValueType`, `angleRange`, `rotation`, `rotationType`, `totalTickCount`, `majorTickEvery`, `showLabels`, `labelTexts` (comma-separated), `majorTicksLength`, `minorTicksLength`, `mainArcWidth`, `postDraw`, `drawTicksOnTop`, `sections`
+  - `sections` is a list of `{ objID, identifier, minValue, minValueType, maxValue, maxValueType, useStyle }` — each a range with its own named style, which is how you get warning zones with no C at all. Ranges are half-open and should meet exactly (`100-118`, `118-124`, `124-140`), leaving no gap.
+  - See **Trap 23** before styling one: ticks are drawn on `ITEMS` and `INDICATOR`, not `MAIN`, and it has no needle.
+- `LVGLSpanWidget` (Spangroup, EEZ Studio 0.27+): `mode: "FIXED"|"EXPAND"|"BREAK"`, `overflow: "CLIP"|"ELLIPSIS"`, `indent`, `maxLines`, `align`, and `spans` — a list of `{ objID, text, textType, useStaticText, textFont? }`.
+  - One widget, several runs of text each with its own font, sharing a baseline. The usual shape is a value bound to a variable followed by a literal unit at a smaller size:
+
+    ```jsonc
+    "spans": [
+      { "objID": "...", "text": "BattPercentText", "textType": "expression", "useStaticText": false },
+      { "objID": "...", "text": " %", "textType": "literal", "useStaticText": true,
+        "textFont": "MONTSERRAT_20" }
+    ]
+    ```
+
+  - **Binding works with `flowSupport: false`** — a span's `textType: "expression"` generates `lv_span_set_text(state->span_N, get_var_<name>())` exactly like a label. Verified on 0.29.0 / LVGL 9.2.2.
+  - Set `widthUnit`/`heightUnit` to `"content"`; a Spangroup should size to its text.
+  - **Never give a span `textColor`** — see **Trap 28**. Differentiate runs with `textFont` and let the group's style carry the colour.
+  - Note for reviewers: the generated tick code re-sets the span text and calls `lv_spangroup_refr_mode()` **every tick without diffing**, unlike a label, which compares with `strcmp` first. Harmless at dashboard scale; worth knowing if you have many spans on a slow target.
+
+### Grid and flex layout (0.26+)
+
+`layout` is not a widget field — it lives in the parent's `localStyles` under `MAIN.DEFAULT`, alongside the track definitions. Children then carry `grid_cell_*` keys in *their* `localStyles`. Prefer this over pixel positions: it is the difference between a project that moves to another panel size and a project that gets re-authored.
+
+```jsonc
+// parent: 3 equal columns, one row, header/body/footer rows on the screen root
+"localStyles": { "objID": "...", "definition": { "MAIN": { "DEFAULT": {
+    "layout": "GRID",
+    "grid_column_dsc_array": "FR(1), FR(1), FR(1)",
+    "grid_row_dsc_array": "CONTENT, FR(1), CONTENT",
+    "pad_row": 12, "pad_column": 12
+}}}}
+
+// each child
+"localStyles": { "objID": "...", "definition": { "MAIN": { "DEFAULT": {
+    "grid_cell_column_pos": 0, "grid_cell_column_span": 1,
+    "grid_cell_row_pos": 1,    "grid_cell_row_span": 1,
+    "grid_cell_x_align": "STRETCH", "grid_cell_y_align": "STRETCH"
+}}}}
+```
+
+- `FR(n)` is a share of the space left over; `CONTENT` sizes the track to its contents.
+- `grid_cell_x_align: "STRETCH"` is what makes a child actually fill its cell. Without it the child keeps its authored `width`/`height` and the grid only positions it. This is the single most common reason a "grid layout" doesn't reflow.
+- `layout: "FLEX"` uses `flex_flow: "ROW"|"COLUMN"`, `flex_main_place`, `flex_cross_place`, `flex_track_place` — good inside a card, where you want a vertical stack rather than a matrix.
+- **A STRETCH child's authored `width`/`height` still matters**: it is what the EEZ Studio canvas draws, and what a reviewer compares against. Keep it equal to the cell size at the authored display resolution or the canvas and the device disagree at rest.
+- **Grid does not scale a child's contents.** A card on an `FR(1)` column widens on a bigger display; a gauge inside it authored at 236 px stays 236 px. If you want the contents to scale too, the inner widgets need `widthUnit: "%"` as well — and see the concentric-Arc warning in Trap 23 before you do that to a gauge.
 
 ### Styles (named, reusable)
 
@@ -1543,6 +1687,269 @@ Or in EEZ Studio: select the widget, open Flags panel, tick **Checkable**, save.
 
 **Adjacent gotcha** for checkboxes specifically: LVGLCheckboxWidget defaults to a text label of "Check box". If you clear the label to empty string and rely on a sibling label for the description, the checkbox may render tiny (the sqaure with no adjacent text-anchor). That's a separate layout issue, not the same as CHECKABLE — but if you're already patching a checkbox to add CHECKABLE, verify the label + width at the same time.
 
+### Trap 22 — Nothing on the panel ever updates, because `ui_tick()` is the application's job and the simulator hides that
+
+EEZ Studio generates `ui_tick()` in `ui.c`. It calls `tick_screen()`, and `tick_screen()` is what reads **every expression-bound property** through its `get_var_*()` accessor. If those accessors are also where you pump your data model (the usual arrangement — see `vars.c`), then `ui_tick()` is the only thing driving the entire UI.
+
+Nothing calls it for you on the device.
+
+The symptom is specific and misleading: the screen draws **perfectly**, every widget in the right place with the right style, and then never changes again. No gauge moves, no label updates, a runtime-populated list stays empty however well the code behind it works. It reads like a data-layer bug, so that is where you go looking, and the data layer is fine.
+
+**It is easy to miss because the full simulator does not need it.** The eez-open simulator's own `main.c` calls `ui_init()` and then `ui_tick()` in its loop, so the whole UI ticks there for free. You can build a screen, watch every gauge sweep correctly in the simulator, flash it, and get a frozen panel — the one case where the simulator passing tells you nothing.
+
+The fix is an `lv_timer`, created inside the display lock right after `ui_init()`:
+
+```c
+static void ui_tick_timer_cb(lv_timer_t *t) { (void)t; ui_tick(); }
+
+if (bsp_display_lock(0)) {
+    ui_init();
+    /* An lv_timer runs in the LVGL task, so the display lock is already held
+     * when the callback fires and must NOT be taken again. */
+    lv_timer_create(ui_tick_timer_cb, 50, NULL);
+    bsp_display_unlock();
+}
+```
+
+Two things to get right: the timer callback runs **in the LVGL task**, so do not take the display lock inside it (deadlock), and the period should be comfortably faster than your data model's own update rate so the tick is never the limiting factor.
+
+**Check for this first** whenever the user says a screen "looks right but doesn't do anything". `grep -rn "ui_tick" main/` — if the only hit is the definition in `ui.c`, that is the bug.
+
+### Trap 23 — LVGL 9 Scale: tick colours live on ITEMS and INDICATOR, not MAIN
+
+An LVGL 9 `Scale` draws in three parts, and a style that sets `line_color` only on `MAIN` leaves two of them at LVGL's built-in default — which is a near-white grey. On a dark theme that looks deliberate. On a light theme the ticks **disappear completely**, and because the widget is still there and still correct, it reads as a rendering bug rather than a missing style.
+
+| Part | What it draws |
+|---|---|
+| `MAIN` | the main line — the arc of a round scale, the baseline of a horizontal one |
+| `ITEMS` | the **minor** ticks |
+| `INDICATOR` | the **major** ticks **and their labels** |
+
+So a Scale style needs all three, and `INDICATOR` needs `text_color` and `text_font` as well or the numeric labels fall back too:
+
+```python
+style("ScaleRing", "LVGLScaleWidget",
+    MAIN__DEFAULT={"line_color": "TickColor", "line_width": 2, "line_opa": 255, ...},
+    ITEMS__DEFAULT={"line_color": "TickColor", "line_width": 2, "line_opa": 255},
+    INDICATOR__DEFAULT={"line_color": "TextMuted", "line_width": 3, "line_opa": 255,
+                        "text_color": "TextMuted", "text_font": "MONTSERRAT_12"},
+)
+```
+
+Verify in the generated `styles.c` — you should see all three parts registered:
+
+```c
+lv_obj_add_style(obj, get_style_scale_ring_MAIN_DEFAULT(),      LV_PART_MAIN      | LV_STATE_DEFAULT);
+lv_obj_add_style(obj, get_style_scale_ring_ITEMS_DEFAULT(),     LV_PART_ITEMS     | LV_STATE_DEFAULT);
+lv_obj_add_style(obj, get_style_scale_ring_INDICATOR_DEFAULT(), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+```
+
+This is Trap 18 (empty styles fall through to LVGL defaults) wearing a different hat, and it is worth its own entry because the part names are not guessable and the light-theme-only failure hides from anyone developing on a dark theme.
+
+**Two more Scale facts that cost time:**
+
+- **Scale has no needle in LVGL 9.** The old Meter widget had one; Scale does not. The moving indicator you see on any LVGL 9 gauge is a **separate Arc** sitting on top, authored over the same range. Two widgets, not one — and the Arc needs its own inset to stay concentric with the ring.
+- **The Arc's inset is a concentricity constraint, not decoration.** The Arc is positioned inside the Scale by a fixed inset (e.g. a 184 px Arc at `left: 26, top: 26` inside a 236 px Scale). If you later convert the Scale to percentage sizing so it grows with a grid cell, that px inset no longer centres the Arc and the two rings visibly drift apart — which looks far worse than a gauge that simply didn't grow. Convert both, or neither. Tick lengths, `mainArcWidth` and label fonts stay in px regardless, so a much larger gauge renders thin-lined.
+- **Scale's range is integer only.** Anything fractional has to be carried as a scaled integer — decivolts for a 10.0–14.0 V gauge means a range of 100 to 140. Fix this in the data model, not in the widget, and keep the scaling in one place or the tick labels and the value will disagree.
+
+### Trap 24 — A named style declares the widget type it is for, and `verify_project.py` does not check it
+
+Every entry in `lvglStyles.styles` carries a `forWidgetType`. Apply that style to a different widget type and:
+
+- the C generator accepts it and the firmware builds and runs,
+- EEZ Studio's **Check panel** reports `Style "X" is not for this widget type`,
+- and on the canvas the widget falls back to the LVGL default look.
+
+Which is the canvas-device divergence this whole skill exists to prevent (Mode B), arriving through a field that reads as documentation rather than a constraint.
+
+**Gate 3 does not catch it.** `verify_project.py` only checks that the referenced style *exists*. Found the hard way: a `ScanRow` style written `forWidgetType: "LVGLPanelWidget"` and then applied to eight scan-result `LVGLButtonWidget`s — eight Check-panel errors the user had to paste in before anyone knew.
+
+Add this audit to any project generator, and run it before writing the file:
+
+```python
+def audit_style_widget_types(proj):
+    declared = {st["name"]: st.get("forWidgetType")
+                for st in proj["lvglStyles"]["styles"]}
+    issues = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            name, wtype = node.get("useStyle"), node.get("type")
+            want = declared.get(name)
+            if name and wtype and want and want != wtype:
+                issues.append(
+                    f"{node.get('identifier', '?')}: useStyle '{name}' is "
+                    f"forWidgetType {want}, applied to {wtype}")
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+
+    walk(proj["userPages"])
+    walk(proj.get("userWidgets", []))
+    return issues
+```
+
+If you need one style across several widget types, define one per type rather than reusing — the name is cheap and the divergence is not.
+
+### Trap 25 — `lvglVersion` in the project must match the LVGL version the firmware actually links
+
+EEZ Studio switches the API it emits based on `settings.general.lvglVersion`. The clearest case is Spangroup:
+
+| Project `lvglVersion` | Emitted calls |
+|---|---|
+| 9.2.2 | `lv_spangroup_new_span()`, `lv_spangroup_refr_mode()` |
+| 9.3+ | `lv_spangroup_add_span()`, `lv_spangroup_refresh()` |
+
+Export a 9.3 project against a 9.2.2 library and `screens.c` will not compile; export a 9.2.2 project against 9.3+ and it will not link. Neither error points at the version — they land in generated code or in somebody else's component and read like a broken SDK.
+
+Three rules:
+
+1. **Pin the firmware's LVGL exactly** (`lvgl/lvgl: "~9.2.2"`), and say in a comment that it must agree with `lvglVersion`.
+2. **Pin whatever sits on top of LVGL too.** A display-port component asking for `"^2"` will happily resolve to a version written against a newer LVGL and fail to compile *inside itself*. On ESP-IDF that is `espressif/esp_lvgl_port`; pin it beside the LVGL pin and bump the two together, never one alone.
+3. **The version is usually not yours to choose.** It is whatever your BSP or display port supports. Set `lvglVersion` to match that, not to the newest EEZ Studio offers.
+
+Worth knowing: the simulator container checks out the LVGL version the project declares, so device and simulator run the same LVGL — which is only true if rule 1 holds.
+
+### Trap 26 — An LVGL keyboard types into nothing until it is told which textarea it owns
+
+`lv_keyboard` needs `lv_keyboard_set_textarea()`. Until then the keys animate on touch and produce no characters.
+
+The trap is not forgetting the call — it is making it on **one** path into the screen. If you bind the keyboard when the user picks a list row, then anyone who reaches the keyboard by tapping the password field directly gets a keyboard that visibly responds and types nothing.
+
+Bind it wherever the keyboard becomes reachable: on screen load for a single-field form, and in the focus handler of each textarea on a multi-field one.
+
+```c
+lv_keyboard_set_textarea(objects.wifi_keyboard, objects.wifi_password);
+```
+
+This one is worth remembering as the canonical argument for the full simulator. On hardware, a keyboard that lights up under your finger and produces no text does not look like a missing line of code — it looks like a half-working touch controller, and it sends you into the touch driver for an evening. On the laptop, with the source next to the window, it is about ten seconds.
+
+### Trap 27 — The simulator is stricter than the device: transitively-included headers and implicit declarations
+
+The device build and the simulator build do not have the same rules, and the asymmetry runs in one direction: **code that compiles on the device can fail in the container.**
+
+Two causes stack up:
+
+1. **ESP-IDF headers include a lot for you.** `esp_log.h` pulls in `<string.h>`, among others. A file in the export folder that calls `memset()` without including `<string.h>` compiles clean on the device — the declaration arrived through the back door. The simulator excludes `esp_log.h` (Constraint 2), the back door closes, and the call is suddenly undeclared.
+2. **The container builds with clang, where an implicit declaration is an ERROR**, not the warning host gcc gives you by default. So the same missing include that is silent in two places becomes a hard build failure in the third.
+
+The result reads as "the simulator broke", which sends you looking at the simulator. The actual fault is a file that never declared its own dependencies and got away with it twice:
+
+```
+/project/src/actions.c:409:5: error: call to undeclared library function 'memset'
+    ... ISO C99 and later do not support implicit function declarations
+```
+
+**Two rules:**
+
+- **Include what you use, in every file in the export folder.** `<string.h>` for `mem*`/`str*`, `<stdio.h>` for `snprintf`, `<stdlib.h>` for `abs`/`strtol`. Never rely on LVGL or an ESP-IDF header to supply a standard header for you — that dependency is invisible and it evaporates under the simulator's `#ifdef`. It is worth a comment on the include itself, because the next person will see an "unused" include and tidy it away.
+- **Make the local proxy check match the container's strictness**, or it will keep passing while the container fails:
+
+  ```bash
+  gcc -fsyntax-only -std=gnu17 \
+      -Werror=implicit-function-declaration \
+      -Werror=implicit-int -Wall \
+      -DEEZ_LVGL_SIMULATOR -DLV_CONF_SKIP ...
+  ```
+
+  Without `-Werror=implicit-function-declaration` the proxy is checking a weaker standard than the thing it is a proxy for, which is worse than not having it — it reports OK and you hand the user a broken build.
+
+**Audit the whole folder, not just the file you touched.** One grep finds every latent instance before it becomes the next failure:
+
+```bash
+for f in main/UI/*.c; do
+    u=$(grep -o '\b\(memset\|memcpy\|strn\?cpy\|strn\?cmp\|strlen\|snprintf\)\b' "$f" | sort -u | tr '\n' ' ')
+    [ -n "$u" ] && printf '%-24s %-40s string.h:%s stdio.h:%s\n' \
+        "$(basename $f)" "$u" \
+        "$(grep -c '#include <string.h>' $f)" "$(grep -c '#include <stdio.h>' $f)"
+done
+```
+
+Run it once per project. Found two files this way on a project where only one had failed — the second was a `snprintf` in `vars.c` that was still riding in on an LVGL header and would have broken the moment that header changed.
+
+### Trap 28 — Never give a span a `textColor` (0.29.0 codegen bug: `screens.c` won't compile)
+
+A `LVGLSpanWidget` run whose `textColor` names a **theme colour token** makes EEZ Studio register a theme-update callback for it. `change_color_theme()` then emits
+
+```c
+lv_style_set_text_color(span_1_style, ...);
+```
+
+but `span_1_style` is a **local variable inside `create_screen_<name>()`**, not a file-scope object. So the generated `screens.c` does not compile, and the error is in generated code you are forbidden to edit, pointing at a symbol you never wrote.
+
+**Differentiate span runs with `textFont` and let the group's style supply the colour.** That is enough for the usual big-number/small-unit pattern and it sidesteps the bug entirely.
+
+Audit for it in any generator, because it is easy to reintroduce and the failure is a confusing one:
+
+```python
+def audit_span_colors(proj):
+    issues = []
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "LVGLSpanWidget":
+                for i, sp in enumerate(node.get("spans") or []):
+                    if sp.get("textColor"):
+                        issues.append(f"{node.get('identifier','?')} span[{i}]: "
+                                      f"textColor {sp['textColor']!r} — remove it, "
+                                      f"differentiate by textFont")
+            for v in node.values(): walk(v)
+        elif isinstance(node, list):
+            for x in node: walk(x)
+    walk(proj["userPages"]); walk(proj.get("userWidgets", []))
+    return issues
+```
+
+### Trap 29 — A stale `file(GLOB)` silently links a firmware with NO UI, and reports success
+
+If `main/CMakeLists.txt` collects the generated sources with a glob, a plain `file(GLOB ...)` is evaluated **once**, at CMake configure time. On a tree where the EEZ Studio export has not run yet the globs come back empty, CMake caches that, and every later `idf.py build` cheerfully links a binary with **no generated UI in it** — no error, no warning, "Project build complete". The board boots to a blank screen and you go looking at the display driver.
+
+`CONFIGURE_DEPENDS` makes the build system re-check the glob and reconfigure when the matching set changes, so a fresh export is picked up. But it **cannot be passed unconditionally**: ESP-IDF evaluates every component `CMakeLists.txt` in CMake *script* mode first to collect `REQUIRES`, and `CONFIGURE_DEPENDS` is illegal there (`CONFIGURE_DEPENDS is invalid for script and find package modes`). So guard it:
+
+```cmake
+if(CMAKE_SCRIPT_MODE_FILE)
+    set(UI_GLOB_MODE "")
+else()
+    set(UI_GLOB_MODE CONFIGURE_DEPENDS)
+endif()
+
+file(GLOB UI_GENERATED ${UI_GLOB_MODE} "UI/screens.c" "UI/styles.c" "UI/images.c" "UI/ui.c")
+file(GLOB UI_FONTS  ${UI_GLOB_MODE} "UI/ui_font_*.c")
+file(GLOB UI_IMAGES ${UI_GLOB_MODE} "UI/ui_image_*.c")
+
+# Fail loudly rather than shipping a UI-less binary.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/UI/ui.h" AND NOT UI_GENERATED)
+    message(FATAL_ERROR
+        "main/UI/ui.h exists but no generated sources were found. "
+        "Run `idf.py reconfigure` after an EEZ Studio export.")
+endif()
+```
+
+The `FATAL_ERROR` is the part that matters. A glob is a convenience; an assertion that the export is actually present is what stops a silent failure. Globbing also removes the whole class of "add `ui_image_<name>.c` to SRCS" errors in the troubleshooting table — new fonts and bitmaps are picked up without a CMake edit.
+
+### Trap 30 — The export can be NEWER than the `.eez-project` and still wrong, and headless export is not a substitute
+
+Two separate ways to end up debugging code that does not match the project you just edited.
+
+**EEZ Studio does not reload a project file changed underneath it.** It holds an in-memory copy from when the project was opened. So the sequence "agent edits JSON → user presses Ctrl+B" exports the **old** project, and the output is genuinely newer than the `.eez-project` on disk — which defeats the obvious timestamp check and makes it look like the edit simply had no effect. **After any agent edit, the user must File → Close Project and reopen before Ctrl+B.** Say this every time; do not assume it is remembered, and if a change "didn't take", ask whether the project was reopened before assuming the JSON is wrong.
+
+**Headless `--build-project` is not equivalent to Ctrl+B.** It emits no `ui_font_*.c` at all: its ProjectStore has no `fontsCacheStore`, the font lookup throws, and the catch block is empty — so the export "succeeds" and silently omits every custom font. The firmware then fails at link with `undefined reference to ui_font_<name>`, which reads like the font-registration problem in the troubleshooting table and is not.
+
+So: **interactive Ctrl+B is the only supported export.** If you script it anyway, assert afterwards that `main/UI/` has one `ui_font_*.c` per entry in `fonts[]`, and treat a mismatch as a failed export rather than a build problem.
+
+### Trap 31 — Runtime-populated lists: author every row, make the container scroll, and give the row a CHECKED style
+
+A list whose rows C fills in at runtime — scan results, a menu, a log — has three failure modes that all present as "the feature is broken" rather than "the layout is wrong".
+
+**Author as many rows as C will ever populate.** Whatever you author is the hard cap, because C can only fill widgets that exist. Author eight and the device finds twelve networks, and the four it drops are invisible: no error, no scroll, just an incomplete list. Real cost of this one: the wanted network was the ninth, so the bug looked like a radio or driver fault and the scan code got rewritten twice before anyone counted the rows. Pick the cap from the domain (`WIFI_MAX_APS` = 20), author that many, and hide the unused ones from C.
+
+**The container must actually scroll**, or the rows past the fold are authored, populated and unreachable. Add `SCROLLABLE` to the container's `widgetFlags` and set `flagScrollDirection: "VER"`. Note that Gate 1's overflow check is deliberately skipped inside a `SCROLLABLE` container — overflowing is the point there — so the pixel-math worksheet will not flag this for you.
+
+**Selection needs a style, not just a variable.** If tapping a row selects it, the user has to see which one. Give the row style a `CHECKED` state definition and have C call `lv_obj_add_state(row, LV_STATE_CHECKED)` / `lv_obj_clear_state()` — which is a legitimate C job (state, not geometry). Without it the form fills in with a value the user cannot correlate to anything on screen.
+
+Two adjacent points: see **Trap 14** on why these rows should NOT carry authored placeholder text (it makes the canvas lie about what the device shows), and **Trap 24** — a row style written `forWidgetType: "LVGLPanelWidget"` and applied to row *Buttons* is exactly how that trap was found.
+
 ## Mixed-font alignment: hero widths + ink-centered placement
 
 The pattern that produces visually-correct dashboards where icons, hero values, and unit labels all sit on the same midline regardless of which font each uses. This is the recipe — the traps above are the things that break it.
@@ -1811,7 +2218,7 @@ You read those PNGs back with the Read tool and spot overflow / overlap / wrong 
 - Hidden widgets that should be visible
 - Wrong theme color applied to wrong widget
 
-A working skeleton is at `tmp/render_pages.py` in the TrailCurrent FluidCNC Pendant project — copy and adapt.
+A working skeleton ships with this skill at `render_pages.py` — copy it into the project's `tmp/` and adapt.
 
 **Workflow:** edit generator → run generator (`tmp/gen_eez_project.py`) → run renderer (`tmp/render_pages.py`) → Read the PNGs → iterate. Only ask the user to open EEZ Studio once the renderer says it looks right.
 
@@ -1878,7 +2285,7 @@ def user_widget_instance(ident, x, y, w, h, name):
 # ...
 ```
 
-See `$PROJECT_ROOT/ExampleProjects/TrailCurrentFluidCNCPendant/tmp/gen_eez_project.py` for a fully worked example with 10 screens, 71 styles, 14 fonts, and 3 user widgets.
+For a fully worked generator — 10 screens, 71 styles, 14 fonts, 3 user widgets — see the sample project at `https://github.com/trailcurrentoss/YouTubeCodeSamples` (`eez-studio-update-lvlg-9/`), whose `.eez-project` was produced this way.
 
 ## Validation — always do before sending to the user
 
@@ -1947,13 +2354,23 @@ EEZ Studio's Build (Ctrl+B) emits to `destinationFolder`:
 | `images.h` / `images.c` | converted bitmaps | **NEVER** |
 | `fonts.h` | `extern lv_font_t <name>;` for each custom font | **NEVER** |
 | `styles.h` / `styles.c` | named styles | **NEVER** |
-| `ui.h` / `ui.c` | `ui_init()` and `ui_tick()` (calls create_screen_main, etc.) | **NEVER** |
+| `ui.h` / `ui.c` | `ui_init()`, `ui_tick()`, `loadScreen()` and the `ScreensEnum` | **NEVER** |
+
+**`ui_tick()` will not call itself.** It is what reads every expression-bound property, and on the device driving it is the application's job — see Trap 22, which is the single most expensive omission in this list because the screen still draws perfectly.
+
+**`loadScreen()` works with `flowSupport: false`.** EEZ Studio exports a `ScreensEnum` and `loadScreen()` into `ui.h` regardless of flow support, so a multi-screen project does not require adopting flow. An ordinary C action changes screens in one line:
+
+```c
+void action_show_wifi(lv_event_t *e) { loadScreen(SCREEN_ID_PAGE_WIFI); }
+```
+
+This is a legitimate C job, not canvas-device divergence — it changes *which* screen is shown, never how one is laid out. Prefer it over `lv_scr_load()` directly, because `loadScreen()` also maintains the `currentScreen` index that `ui_tick()` needs; bypass it and the newly-loaded screen never ticks.
 
 You implement (in `main/`):
 
 | File | Content |
 |---|---|
-| `main.c` | BSP init, NVS, optional WiFi, `bsp_display_start_with_config`, `ui_init()`, FreeRTOS event loop |
+| `main.c` | BSP init, NVS, optional WiFi, `bsp_display_start_with_config`, `ui_init()`, an `lv_timer` driving `ui_tick()` (Trap 22), FreeRTOS event loop |
 | `actions.c` | `void action_<Name>(lv_event_t *e) { ... }` for each declared action; dispatch on `lv_event_get_user_data(e)` for variant-encoding actions |
 | `vars.c` | `<type> get_var_<name>() { return current; }` and `set_var_<name>(v) { current = v; }` |
 
@@ -1975,6 +2392,17 @@ and will be overwritten on export.
 
 EEZ Studio is the source of truth for the GUI. flowSupport is OFF; actions are
 implemented in C and selected via `userData` on the event handler.
+
+## Hand-written files inside the export folder
+These live beside the generated files ON PURPOSE — the EEZ Studio full simulator
+copies only the export folder into its container, so anything the UI calls must
+be in there or the simulator will not link. EEZ Studio never overwrites them:
+
+    actions.c  vars.c  <data-model>.c        <- safe to edit
+    screens.* ui.* styles.* images.* fonts.h <- generated, never edit
+
+No ESP-IDF headers in this folder. Device-only code goes in main/, or behind
+`#ifndef EEZ_LVGL_SIMULATOR`.
 ```
 
 ## Quick troubleshooting reference
@@ -1999,6 +2427,14 @@ implemented in C and selected via `userData` on the event handler.
 | C export produces unresolved `objects.btn_xyz` | Widget was added in code before EEZ Studio export ran | Edit the .eez-project, re-export from EEZ Studio, then `idf.py build` |
 | User opens file but title shows a different name | The file failed to load — EEZ Studio shows the previously-open project or default | Bisect to find the offending feature |
 | User reports visual problems you can't tell are real | Iterating blind | Run `tmp/render_pages.py` to generate per-page PNGs and Read them yourself before bothering the user |
+| Screen draws perfectly, then nothing ever updates — no gauge moves, no label changes, a runtime-populated list stays empty | Nobody is calling `ui_tick()`. It reads every expression-bound property, and on the device driving it is the application's job. The simulator calls it for you, so this passes there and fails on hardware. Trap 22. | Create an `lv_timer` calling `ui_tick()` right after `ui_init()`, inside the display lock. `grep -rn ui_tick main/` — if the only hit is the definition in `ui.c`, that is the bug |
+| Scale ticks invisible on the light theme, fine on dark | `line_color` set only on `MAIN`. LVGL 9 draws minor ticks on `ITEMS` and major ticks + labels on `INDICATOR`, which fall through to a near-white default. Trap 23. | Set `line_color` on all three parts, plus `text_color` / `text_font` on `INDICATOR` |
+| EEZ Studio Check panel: `Style "X" is not for this widget type` | The style's `forWidgetType` doesn't match the widget it's applied to. Builds and runs anyway; the canvas falls back to the LVGL default look. `verify_project.py` does NOT catch this. Trap 24. | Define one style per widget type. Add `audit_style_widget_types()` to the generator |
+| Simulator: `call to undeclared library function 'memset'` (or `snprintf`, `strlen`…) — device build is clean | The file relied on an ESP-IDF header for a standard header. Guarding out `esp_log.h` for the simulator removed it, and the container's clang treats implicit declarations as errors. Trap 27. | Add the standard include to that file, audit the rest of the export folder, and add `-Werror=implicit-function-declaration` to the local proxy check |
+| Simulator build fails on any `esp_*` header | Device-only code is inside the export folder | Move it to `main/`, or guard it with `#ifndef EEZ_LVGL_SIMULATOR` |
+| `screens.c` won't compile: `span_N_style` undeclared in `change_color_theme()` | A span was given a `textColor` naming a theme token | Never set `textColor` on a span. Differentiate by `textFont`; let the group's style carry the colour |
+| Spangroup calls don't exist / won't link (`lv_spangroup_add_span` vs `_new_span`) | Project `lvglVersion` disagrees with the LVGL the firmware links. Trap 25. | Match `lvglVersion` to the firmware pin, and pin the display-port component alongside it |
+| Keyboard animates on tap but types no characters | `lv_keyboard_set_textarea()` never ran on the path the user took. Trap 26. | Bind it wherever the keyboard becomes reachable, not just on the selection path |
 | EEZ-authored switch or checkbox renders + accepts a tap (visible press animation) but never toggles LV_STATE_CHECKED / never fires VALUE_CHANGED — while a dynamically-created switch on the same screen works | EEZ Studio's default `widgetFlags` for LVGLSwitchWidget / LVGLCheckboxWidget is `CLICKABLE\|PRESS_LOCK` — no `CHECKABLE`. `lv_switch_create()` in C adds CHECKABLE for free; the EEZ export doesn't. Trap 21. | Append `\|CHECKABLE` to the widget's `widgetFlags` (or tick the **Checkable** checkbox in EEZ Studio's Flags panel), Ctrl+B, reflash |
 
 ## Don'ts
