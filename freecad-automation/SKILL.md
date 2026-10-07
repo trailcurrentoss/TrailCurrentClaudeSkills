@@ -17,7 +17,7 @@ Which install the user has matters. A snap or flatpak build is **sandboxed** and
 
 ### MCP Server (Primary Method — ALWAYS try first)
 
-The `freecad` MCP server is configured globally. **Always use MCP tools first.** If the MCP connection fails, **ask the user to start FreeCAD and enable the MCP server** (TrailCurrent Logo workbench → MCP Server button, port 12785) before falling back to headless scripting.
+The `freecad` MCP server is configured globally. **Always use MCP tools first.** If the MCP connection fails, **ask the user to start FreeCAD and enable the MCP server** (TrailCurrent FreeCAD Tools workbench → MCP Server button, port 12785) before falling back to headless scripting.
 
 Key MCP tools:
 - `execute_code` — Run arbitrary Python in FreeCAD (most powerful)
@@ -202,7 +202,7 @@ The repo working copy and the installed plugin are **different directories**. Th
 running server loads from FreeCAD's Mod folder. Verify before concluding a fix failed:
 
 ```bash
-diff -q <repo>/mcp/rpc_server.py "$(ls -d ~/.local/share/FreeCAD/v*/Mod/*LogoFreeCADPlugin)/mcp/rpc_server.py"
+diff -q <repo>/mcp/rpc_server.py "$(ls -d ~/.local/share/FreeCAD/v*/Mod/TrailCurrentFreeCADTools)/mcp/rpc_server.py"
 ```
 
 FreeCAD 1.0+ uses a **versioned** user path — `~/.local/share/FreeCAD/v1-1/Mod`, not
@@ -366,7 +366,9 @@ len(doc.getObject("Joints").Group)        # 0  -> nothing is constrained
 doc.getObject("A_XRIB_01").ExpressionEngine        # [] -> placement is a typed number
 ```
 
-Check all three before reporting an assembly as built.
+Check all three before reporting an assembly as built. `assembly_ground`,
+`assembly_add_joint` and `assembly_solve` create real joints and print the grounded
+list and solve code; `assembly_solve` with "grounded: NONE" is this trap by name.
 
 ---
 
@@ -426,16 +428,25 @@ gave `dog_off = cutter_r * (1 - 1/sqrt(2))` = 0.9299359697, matching the modelle
 0.9299 exactly — proof the formula was right, obtained without trusting any arithmetic
 of mine.
 
-### MCP tool gap: there is no sketch-constraint tool
+### Sketch constraints: `sketch_constrain` creates them, `set_expression` drives them
 
-`sketch_add_polyline` adds **coincident constraints only**. `set_expression` binds an
-*existing* constraint but cannot create one. So dimensional constraints — the thing that
-actually makes a sketch parametric — require `execute_code` or the GUI. Say this to the
-user rather than quietly producing a sketch that looks parametric and is not.
+`sketch_add_polyline` adds **coincident constraints only**. A dimensional constraint —
+the thing that actually makes a sketch parametric — comes from `sketch_constrain`, and a
+*named* one is what `set_expression` can bind:
 
-What *is* achievable with the convenience tools alone: grid/repetition parametrics via
-`partdesign_pattern` with `Occurrences` and `Length` bound by `set_expression` to sheet
-aliases.
+```
+sketch_constrain("Profile", "Distance", geo_a=0, value=25, name="width")
+set_expression("Profile", "Constraints.width", "Design.width")
+```
+
+`sketch_add_rectangle(..., name_prefix="tab")` does the whole job for a rectangle: four
+lines, Horizontal/Vertical, named `tab_width` / `tab_height` / `tab_x` / `tab_y`, and
+reports `fully constrained: True`. `sketch_list_geometry` prints the indices the
+constraint tool needs. A constraint that would make the sketch conflicting or redundant
+is removed again and reported as an ERROR line, so the sketch is never left broken.
+
+Grid/repetition parametrics still go through `partdesign_pattern` with `Occurrences`
+and `Length` bound by `set_expression` to sheet aliases.
 
 ### Three silent failures when building a slotted part
 
@@ -458,13 +469,16 @@ cuts nothing. After the mapping the two disagree (`Midplane=False` while
 `SideType='Symmetric'`); **`SideType` is authoritative**, so read that, not `Midplane`,
 when checking whether a cut is configured correctly.
 
-The MCP's `partdesign_feature` sets `midplane` explicitly on every call, so it always
-trips this. Create the pocket with the tool, then set `SideType` directly afterwards.
+`partdesign_feature` takes `side_type="Symmetric"` (and `type="ThroughAll"`,
+`"UpToFace"`, ...) directly and never touches `Midplane`. It also prints the Body volume
+before and after, with a WARNING when the delta is zero — read that line.
 
-**`partdesign_pattern` appends the pattern at the END of the Body and does not move
-`Tip`.** After patterning, `Tip` still points at whatever feature was current, so every
-patterned instance silently drops out of the result shape. Symptom: the body looks
-under-cut by exactly the patterned features. Always re-assert the Tip:
+**A pattern created by hand (`doc.addObject("PartDesign::LinearPattern")` +
+`body.addObject`) does not move `Tip`.** `Tip` still points at whatever feature was
+current, so every patterned instance silently drops out of the result shape. Symptom: the
+body looks under-cut by exactly the patterned features. The `partdesign_pattern` tool
+sets the Tip for you and reports the volume change; in hand-written code always
+re-assert it:
 
 ```python
 b.Tip = doc.getObject("LinearPattern")   # last feature in the real chain
@@ -472,7 +486,8 @@ b.Tip = doc.getObject("LinearPattern")   # last feature in the real chain
 
 **A spreadsheet edit does not touch its dependents over the MCP.** `recompute` returns
 `Recomputed 0 objects` and the model does not move, which reads as "the binding is
-broken" when the binding is fine. Force it:
+broken" when the binding is fine. Force it with the `touch` tool on the sheet (it
+recomputes and reports the downstream objects), or by hand:
 
 ```python
 for o in doc.Objects: o.touch()
@@ -508,8 +523,17 @@ Prefer, in order:
 
 1. The dedicated tool (`set_visibility` handles Tip/Link/container traps for you, and
    takes a comma-separated list, so 65 toggles is 3 calls).
-2. `execute_code` where **no tool exists** — Sketcher constraints, joint creation,
-   multi-object audits.
+2. `execute_code` where **no tool exists** — FEM, Surface, Points, OpenSCAD, and
+   multi-object audits the tools do not cover. Sketch constraints, datums, dress-ups,
+   holes, revolves, lofts, pipes, helices, binders, appearance, meshes, sub-element
+   measurement, assembly joints, CAM jobs and TechDraw pages all have tools now
+   (`sketch_constrain`, `create_datum`, `partdesign_dressup`, `partdesign_hole`,
+   `partdesign_revolve`, `partdesign_loft`, `partdesign_pipe`, `partdesign_helix`,
+   `create_shapebinder`, `set_appearance`, `shape_to_mesh`, `measure_element`,
+   `point_inside`, `measure_distance`, `assembly_ground`, `assembly_add_joint`,
+   `assembly_solve`, `assembly_bom`, `cam_create_job`, `cam_add_tool`,
+   `cam_add_operation`, `cam_add_dressup`, `cam_post`, `cam_audit`,
+   `drawing_create_page`, `drawing_add_view`, `drawing_export`).
 
 Also: reading the project's build script with `grep`/`sed` when the live document can
 answer the question is the same mistake. Ask the model, not the source.
@@ -984,6 +1008,12 @@ obj = PathJob.Create("Job", base, template)          # App layer: no ViewProvide
 obj.ViewObject.Proxy = ViewProvider(obj.ViewObject)  # <- the GUI layer adds this
 obj.ViewObject.addExtension("Gui::ViewProviderGroupExtensionPython")
 ```
+
+The MCP's `cam_create_job`, `cam_add_tool`, `cam_add_operation`, `cam_add_dressup`
+and `cam_post` tools do all of the below for you (Gui-layer job, task panel
+suppressed, tool-controller dialog answered, G-code written and verified, editor
+flag restored). Prefer them; `cam_audit` is the one-call tree check. Everything
+that follows is what they encode, for when you must script by hand.
 
 So in a GUI session **always build CAM through the `*.Gui.*` layer**:
 
