@@ -265,6 +265,13 @@ The per-widget table below covers every concrete widget class found under `https
 - **`defaultFlags`** is the flag string the LVGL constructor (`lv_<thing>_create`) sets by default — the export diff compares the widget's `widgetFlags` against this string and emits `lv_obj_clear_flag` / `lv_obj_add_flag` for the deltas. (Reactive flags `HIDDEN` and `CLICKABLE` are managed via the lifted `hiddenFlag`/`clickableFlag` fields.)
 - **`parts`** is the set of `LV_PART_*` values that are valid in `localStyles.definition` and `useStyle` for this widget.
 - **Widget-specific properties** beyond the Base schema, with defaults from each file's `defaultValue` block.
+- **`<name>Type` companions are per-property, not a pattern.** Some numeric
+  properties carry a `<name>Type` (`"literal"` / `"expression"`) and a
+  `preview<Name>`; others are plain numbers. Arc's numerics all have the
+  triple; Scale's `angleRange` / `totalTickCount` / `majorTickEvery` and
+  Textarea's `maxTextLength` have none. Do not infer one widget's shape
+  from another's — an invented key is not ignored, and a missing
+  `preview*` shows up only as a canvas that disagrees with the device.
 - **Runtime geometry override** call-outs — widgets whose constructor / `set_*` calls reset the authored `width`/`height` after creation are flagged. For those widgets you must pin the geometry via `localStyles.MAIN.DEFAULT` with all of `align: "DEFAULT"`, `min_width`, `max_width`, `min_height`, `max_height` (set equal to the desired pixel size). This is the "min_*/max_*/align pinning" the skill's SKILL.md references.
 
 ### 4.1 LVGLLabelWidget
@@ -323,7 +330,35 @@ The per-widget table below covers every concrete widget class found under `https
 - Class: `LVGLArcWidget` — Arc.tsx:37
 - `defaultFlags`: `CLICKABLE|CLICK_FOCUSABLE|GESTURE_BUBBLE|PRESS_LOCK|SCROLL_ELASTIC|SCROLL_MOMENTUM|SCROLL_WITH_ARROW|SNAPPABLE`
 - `parts`: `["MAIN", "INDICATOR", "KNOB"]`
-- Specific properties include `rangeMin`, `rangeMax`, `value`, `bgStartAngle`, `bgEndAngle`, `startAngle`, `endAngle`, `mode` (`"NORMAL"` / `"SYMMETRICAL"` / `"REVERSE"`), `rotation`, `useAngle`, plus the corresponding `*Type` fields and editor-only `preview*` fields. Read Arc.tsx for the full list — it's the largest single-file widget definition outside Meter/Scale.
+- Specific properties. Observed `defaultValue` from the shipped application:
+
+```js
+rangeMin: 0,  rangeMinType: "literal",
+rangeMax: 100, rangeMaxType: "literal",
+value: 25, valueType: "literal", previewValue: "25",
+mode: "NORMAL",
+startAngle: 135, startAngleType: "literal", previewStartAngle: "135",
+endAngle: 45,    endAngleType: "literal",   previewEndAngle: "45",
+bgStartAngle: 135, bgStartAngleType: "literal", previewBgStartAngle: "135",
+bgEndAngle: 45,    bgEndAngleType: "literal",   previewBgEndAngle: "45",
+rotation: 0, rotationType: "literal", previewRotation: "0"
+```
+
+Every numeric property travels as a **triple**: the value, a `<name>Type`
+(`"literal"` or `"expression"`), and a `preview<Name>` that is a **string**
+even though the value it mirrors is a number.
+
+**Omitting the `preview*` fields is silently wrong.** They are what the
+editor canvas draws. A project missing them builds, runs correctly on the
+device, and shows a default-looking arc on the canvas — canvas-device
+divergence that no validator reports because both files are individually
+valid.
+
+`mode` is `"NORMAL"` / `"SYMMETRICAL"` / `"REVERSE"`. `useAngle` exists as a
+class field and gates whether the arc is driven by range/value or by raw
+angles, but it is **not** in `defaultValue`; leave it out unless you mean to
+set it.
+
 
 ### 4.6 LVGLBarWidget
 
@@ -451,11 +486,17 @@ The per-widget table below covers every concrete widget class found under `https
 
 | Key | Type | Notes |
 |---|---|---|
-| `placeholder` | string | |
-| `oneLineMode` | boolean | |
-| `passwordMode` | boolean | |
-| `acceptedCharacters` | string | |
-| `maxTextLength` | number | |
+| `text` | string | Paired with `textType: "literal"`. |
+| `placeholder` | string | Default `""`. |
+| `oneLineMode` | boolean | Default `false`. |
+| `passwordMode` | boolean | Default `false`. |
+| `acceptedCharacters` | string | Default `""`. |
+| `maxTextLength` | number | Default `128`. **No `maxTextLengthType` companion** — that key does not exist. |
+
+Observed `defaultValue`: `left: 0, top: 0, width: 150, height: 70,
+clickableFlag: true, text: "", textType: "literal", placeholder: "",
+oneLineMode: false, passwordMode: false, acceptedCharacters: "",
+maxTextLength: 128`.
 
 ### 4.18 LVGLListWidget
 
@@ -521,7 +562,34 @@ Per-button `ctrl*` flags are the `LV_BUTTONMATRIX_CTRL_*` bits from lvgl-constan
 - Class: `LVGLLineWidget` — Line.tsx:28
 - `defaultFlags`: `CLICK_FOCUSABLE|GESTURE_BUBBLE|PRESS_LOCK|SCROLLABLE|SCROLL_CHAIN_HOR|SCROLL_CHAIN_VER|SCROLL_ELASTIC|SCROLL_MOMENTUM|SCROLL_WITH_ARROW|SNAPPABLE`
 - `parts`: `["MAIN"]`
-- Specific: `points` (array of {x,y}), `invertY`, `needleLength`, `previewValue`.
+- Specific properties:
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `points` | **string** | `"0,0 50,50 100,0 150,50 200,0"` | **Not an array.** A flat list of numbers separated by whitespace or commas, consumed in pairs. EEZ Studio parses it as `this.points.trim().split(/\s+\|,/)` and errors if the count is odd or any token is not a float. Coordinates are **pixels** relative to the widget origin; there is no percent form. |
+| `invertY` | boolean | `false` | |
+| `needleLength` | number | `0` | Only meaningful when the line is a scale needle (see below). |
+| `value` | number-or-expression | `0` | Needle value. |
+| `valueType` | `"literal"` \| `"expression"` | `"literal"` | |
+| `previewValue` | number | `0` | Editor-only. |
+
+**Authoring `points` as an array of `{x, y}` fails at Build time** with:
+
+```
+TypeError: this.points.trim is not a function
+```
+
+The message names no widget and no page, so it is a long way from the line
+widget that caused it. Earlier revisions of this document described `points`
+as "array of {x,y}"; that was wrong and is the reason this entry now carries
+the observed default and the parse expression.
+
+**Scale needle.** A `LVGLLineWidget` whose parent is a `LVGLScaleWidget`
+becomes a needle (`isScaleNeedle`), which changes code generation: it is
+created with `createObjectWithoutPosAndSize` and driven by `value` /
+`needleLength` rather than by `points`. A line intended as an ordinary
+polyline must therefore be a **sibling** of the scale, not a child of it.
+
 
 ### 4.26 LVGLCanvasWidget
 
@@ -563,7 +631,34 @@ Per-button `ctrl*` flags are the `LV_BUTTONMATRIX_CTRL_*` bits from lvgl-constan
 - Class: `LVGLScaleWidget` — Scale.tsx:394
 - `defaultFlags`: `CLICKABLE|CLICK_FOCUSABLE|GESTURE_BUBBLE|PRESS_LOCK|SCROLLABLE|SCROLL_CHAIN_HOR|SCROLL_CHAIN_VER|SCROLL_ELASTIC|SCROLL_MOMENTUM|SCROLL_WITH_ARROW|SNAPPABLE`
 - `parts`: `["MAIN", "ITEMS", "INDICATOR"]`
-- Specific: `scaleMode` (`HORIZONTAL_TOP`/`HORIZONTAL_BOTTOM`/`VERTICAL_LEFT`/`VERTICAL_RIGHT`/`ROUND_INNER`/`ROUND_OUTER`), `angleRange`, `totalTickCount`, `majorTickEvery`, `postDraw`, `drawTicksOnTop`, `showLabels`, `labelTexts`, plus main-line / arc / minor-tick / major-tick width/color/opacity/length properties. Read Scale.tsx for the full list.
+- Specific properties. Observed `defaultValue`:
+
+```js
+scaleMode: "HORIZONTAL_BOTTOM",
+minValue: 10, minValueType: "literal",
+maxValue: 40, maxValueType: "literal",
+angleRange: 270,
+rotation: 135, rotationType: "literal",
+totalTickCount: 31, majorTickEvery: 5,
+postDraw: false, drawTicksOnTop: false,
+showLabels: true, labelTexts: "", sections: []
+```
+
+`scaleMode` is `HORIZONTAL_TOP` / `HORIZONTAL_BOTTOM` / `VERTICAL_LEFT` /
+`VERTICAL_RIGHT` / `ROUND_INNER` / `ROUND_OUTER`. There are also
+main-line / arc / minor-tick / major-tick width/colour/opacity/length
+properties, all `undefined` by default — omit them unless setting one.
+
+**`angleRange`, `totalTickCount` and `majorTickEvery` take NO `<name>Type`
+companion**, unlike Arc's numerics. `minValue`, `maxValue` and `rotation`
+do. There is no rule to infer here — check the bundle rather than reasoning
+by analogy from Arc. Adding `angleRangeType` is not ignored; it is an
+unknown key.
+
+`rotation` is where the FIRST tick sits, in LVGL's convention where 0 is 3
+o'clock. For a clock face it must be `270`; the `135` default puts the
+first tick at the lower left.
+
 
 ### 4.32 LVGLSpanWidget
 

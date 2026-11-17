@@ -1,6 +1,6 @@
 ---
 name: blender-automation
-description: Drive Blender through the `blender` MCP server (or its raw socket on `localhost:9876`) to build product renders, material and lighting rigs, and multi-stage assembly animations from CAD. Use whenever a task involves Blender, a `.blend` scene, importing CAD geometry into Blender, rendering a product still or turntable, configuring Cycles or EEVEE, or encoding rendered frames to MP4/WebM. Import CAD as glTF, never STL — STL collapses the whole assembly into one grey material. Never call `bpy.ops.render.render()` for an animation through `execute_code`; it blocks Blender's UI thread. Covers the traps that silently cost hours: `read_factory_settings` tearing down the MCP socket, a sandboxed Blender refusing to read `/tmp`, the parent-child double-translation bug, `hide_render` not cascading to mesh children, FreeCAD's glTF exporter writing every material as metallic=1, matte black rendering as mid-grey under Filmic, and long-animation render timeouts that are purely cosmetic because the render completes anyway.
+description: Drive Blender through the `blender` MCP server (or its raw socket on `localhost:9876`) to build product renders, material and lighting rigs, and multi-stage assembly animations from CAD. Use whenever a task involves Blender, a `.blend` scene, importing CAD geometry into Blender, rendering a product still or turntable, configuring Cycles or EEVEE, or encoding rendered frames to MP4/WebM. Import CAD as glTF, never STL — STL collapses the whole assembly into one grey material. Never call `bpy.ops.render.render()` for an animation through `execute_code`; it blocks Blender's UI thread. Covers the traps that silently cost hours: `read_factory_settings` tearing down the MCP socket, a sandboxed Blender refusing to read `/tmp`, the parent-child double-translation bug, `hide_render` not cascading to mesh children, FreeCAD's glTF exporter writing every material as metallic=1, matte black rendering as mid-grey under Filmic, and long-animation render timeouts that are purely cosmetic because the render completes anyway. Also covers characters and mascots: generating a mesh from an approved model sheet (Hunyuan3D), projecting the sheet as colour, scripted Rigify rigging and its regeneration traps, walk animation, and rendering matching on-screen clips and print-ready merch stills.
 ---
 
 # Blender Automation
@@ -863,3 +863,182 @@ for fc in pivot.animation_data.action.fcurves:
 - Product-specific 3D scenes: `Product/<Name>/CAD/`
 
 All paths are relative to `$PROJECT_ROOT` (see "Environment configuration").
+
+## Characters and Mascots: Generate, Rig, Animate, Render
+
+Lessons from building a brand mascot that has to look identical in video and on printed merch. The goal for any mascot: **one 3D model is the single source** for every on-screen appearance, web image, firmware sprite and merch print, so the audience recognizes the same character everywhere.
+
+### Pipeline that worked
+
+1. **Approve a design image first.** Generate a few full-body model-sheet candidates with an image model (front view, relaxed A-pose, arms away from the body, whole figure in frame, plain white background, no props or backpack), and let the user pick one. Every later step derives from that one image.
+2. **Let a 3D-generation model build the mesh** from the approved sheet (Hunyuan3D 2.1 in ComfyUI: 30 steps, cfg 5, 4096 latent tokens, octree 256, surface-net 0.6). **Remove the background first.** A white backdrop gets reconstructed as walls and a floor around the character.
+3. **In Blender, do only mechanical work:** scale, light decimate, project colours, rig, pose, animate, light, render. Don't sculpt faces or reshape bodies by script. Scripted reshaping caused every major defect in the first attempt (child proportions, beard lumps, mismatched hands, cross-eyes).
+4. **Never use an image model for individual character images or poses** after this point. Every image is a render of the model. Image models drift the face on every generation.
+
+### Texturing a generated mesh from its model sheet
+
+- **Planar front projection** of the approved sheet: UV = sheet pixel at the vertex's (x, z), aligned by the figure's bounding box. Map the true-normal Y to a mix factor so forward-facing faces show the sheet and side/back faces show per-vertex colour.
+- **Side and back colour:** sample the sheet at the same (x, z), but first
+  - **fill the sheet's background** outward from the figure's own edge colours (push-pull pyramid fill), so samples at the silhouette never pick up white,
+  - **blur it heavily** (box blur, radius ~14 px on a 1296 px sheet), so the back of the jacket doesn't get the front's zipper and pockets,
+  - **sample a little inward** for side-facing vertices (offset x by ~3.5 cm × |normal.x|) **toward the limb's own axis**, not toward the body centre. Stepping toward the centre from the inside of a leg or arm lands in the gap between the limbs, which is background fill, and renders as a pale seam down the inner thigh. Legs: axis at ±0.11 m, arms at ±0.30 m on a 1.75 m figure; do the same for the projection UVs of the inner leg faces (2 cm).
+- **The head needs explicit rules,** because the sheet only shows the face:
+  - **Behind the face:** hair, blended in over ~6 cm of depth so the hairline isn't a hard edge.
+  - **Above the brim line:** cap colour, as the median of saturated cap pixels, not a single sample (that grabbed the dark patch).
+  - **Brim underside** (normal.z < −0.45): shaded cap colour, or it renders as a grey band.
+  - **Below the head:** the hood/collar back gets jacket colour.
+  - **Ears stick out** past the head width. Exclude them from the hair rule.
+- **Force the painted face only on forward-facing faces** (true −normal.y > ~0.35). Forcing it further round the cheek stretches the sheet into pale streaks.
+- **Asymmetric face?** Mirror the good half of the sheet's head rows around the head's own symmetry axis (centre of the cap/head silhouette rows), feather ~20 rows below the chin, then project.
+- **Hands:** colour every vertex weighted to `DEF-hand/palm/f_/thumb` with the sheet's skin tone, and fade the projection out on them. Otherwise their sides pick up whatever they hang next to (cargo pockets).
+- **Colour space trap:** `image.pixels` returns display (sRGB) values. `FLOAT_COLOR` attributes are linear. Convert (`((c+0.055)/1.055)**2.4`) before writing, or every sampled area renders washed-out pale.
+- **Camera angle:** projected characters look best within about 20° of the front. Plan hero and merch shots there. Wide or moving shots tolerate the sides.
+
+### Rigging with Rigify (scripted)
+
+- **Measure joints from the mesh,** don't guess. Take z-slices of the mesh, read where the legs split, where the arms separate from the torso, and the narrowest neck and wrist slices. Set each joint's depth to the mesh centre at that height.
+- **Bend direction:** put **knees ~4 cm in front of** and **elbows ~3.5 cm behind** the straight line between their neighbours. Joints placed dead centre make the IK bend knees backward. That reads as a broken, twisted walk.
+- **Move hands as one rigid piece** (hand plus all finger bones): rotate and scale the whole sub-tree from wrist to hand-tip. Placing finger bones one by one breaks the hand.
+- Delete the metarig's face and breast bones if the face is painted on.
+- Bind with `parent_set(type="ARMATURE_AUTO")`, then confirm every vertex got weights.
+- **Stress-test every rig before animating:** arm raised in FK, elbow bent, head turned 25°, knee bent, fist closed. Render close-ups of **the face and both hands** from front, three-quarter and side, not just a thumbnail of the whole figure.
+
+### Rigging fixes found in review
+
+- **Boots as separate objects, and a real hem.** Bisect the trouser legs at a clean height (bmesh `bisect_plane`, `clear_inner=True`), extrude the new loop 2 cm down and 7% outward as a hem lip, then 20% inward as the hem's underside; bisect the boots 1 cm lower and extrude a dark inner collar 5 cm up and inward so it hides in the trouser. Recolour the boot top under the hem with the sheet's collar leather and turn its projection off. A ragged cut ("faces entirely below z") shows the trouser interior as dark shards.
+- **Boots: split at the real ankle, with straight shin bones.** Sole and toe on `DEF-foot`, the shaft on `DEF-shin.001`, blending over the ankle, and `bbone_segments = 1` on the limb DEF bones (see "Walk cycle: ankles"). A fully rigid boot shears against the trouser at the collar; automatic weights alone fold it like a hinge.
+- **Walk arms in FK, not IK.** Moving `hand_ik` while holding its rest rotation bends the wrist as the arm swings. Set `IK_FK = 1` and rotate `upper_arm_fk` (swing), with a small trailing bend on `forearm_fk`. The hand follows with a straight wrist.
+- **Hand/cuff colour:** skin on vertices with summed hand weight above 0.65 (smoothstep from 0.55), the sleeve's median colour on the cuff (hand weight 0.02 to 0.55), and the front projection **fully off** on anything with hand weight above 0.08. A gap between where the cuff rule ends and where the skin rule reaches full strength leaves a pale jagged band at the wrist (the sheet's sleeve rim). Use the **same skin colour as the face**; a hand tone sampled from the sheet's hands came out far darker and more saturated than the face.
+- **Despeckle the vertex colours:** any vertex more than ~35% lighter than its neighbours' average (a sheet edge pixel) takes the neighbours' colour. Three passes over the edge graph clear the pale streaks along hems and cuffs.
+- **Ears:** solid skin where |x| is past the head's own width (measure it). Pull the hairline forward to just in front of the ear, or a skin patch shows beside the ear in profile.
+- **Project the edge-filled sheet, not the cutout.** Where the mesh silhouette is a hair larger than the sheet's, the cutout's transparent edge pixels render as a dark halo around the ears and the cap.
+- **An unused image is dropped on save.** Scripts that run later must load the sheet from its file path, not look it up in `bpy.data.images`.
+
+### Projection and colour traps found in review
+
+- **Never drive the projection mix from the live world normal.** When the character turns toward the camera, his side swings "forward" and the flat sheet smears across it. Store how much each vertex faces the front **once, at rest**, as a float attribute, and read that in the shader.
+- **Don't let an attribute share a name with a UV map** (a UV map called `front` and an attribute called `front`). The Attribute node silently reads the UV coordinates, which in this case painted the face on the back of the head. Check `me.attributes[name].data_type` if a mask behaves strangely.
+- **Don't run `recalc_face_normals` on a generated mesh** without checking. On a Hunyuan mesh it flipped most normals inward. Their exported normals were already correct.
+- **Don't mirror a face half to "fix" asymmetry.** Mirroring the iris too made him cross-eyed. If one side looks wrong, find the cause first: here it was the turn, not the sheet.
+- **Convert sRGB to linear exactly once, after every colour rule.** Rules added after the conversion write unconverted values, which render washed out. A region whose colour "won't change" no matter what you set is the tell.
+- **Use a sky-above, ground-below world,** not one flat colour. A uniform world lights the underside of the jaw, brim and arms as brightly as the top of the cap, which looks like a white patch.
+- **Projection threshold:** a wide cartoon face's sides still face ~40% forward. Use a wide blend (normal.y −0.35 to −0.75) so the face edge fades into flat side colours, and a looser threshold for the middle of the face (nose underside, lips, chin face slightly down but are seen from the front).
+- **Side of the head:** flat colours, not sheet samples, with the boundaries as distance fields thresholded in the shader (see "Clean colour boundaries" below). Per-vertex region painting looked blocky and put hair under the ear lobes.
+- **Ears:** find them geometrically. At each height, measure the skull width just in front of and just behind the ear, then mark anything wider in the ear's depth band as ear. Use that as a gate inside an ellipse field around the ear centre (semi-axes a few mm larger than the measured ear) so the edge is clean.
+- **Boots: split, not rigid.** Sole and toe on `DEF-foot`, the boot shaft on `DEF-shin.001` (it moves with the trouser leg), blending at the real ankle. A fully rigid boot shears against the trouser at the collar.
+- **Lower jaw and neck sit just below the "head" height,** so head rules miss them. Keep the neck rule to the neck itself (a cylinder about 8.5 cm around the neck axis, plus the downward-facing jaw underside). A box "z 1.20–1.30, |x| < 0.15" also covers the hood collar on both sides, which then renders skin-coloured. The collar's front-facing surfaces should keep the sheet projection (lining, shirt collar, zipper top are drawn there); only the jaw underside needs it off.
+
+### Rigify regeneration traps (hit on an existing rig)
+
+- **Regenerating deletes custom bones** (eye bones, extra controls) and **wipes custom properties on pose bones**. Objects bone-parented to deleted bones drop to the rig origin (eyes ended up inside the neck, looking cross-eyed). Store each such object's rest transform as a custom property on the object, and rebuild from it after every regeneration.
+- **Editing the metarig in Edit Mode:** connected bones share endpoints. Compute every target from `bone.head_local`/`tail_local` first, then assign. Mapping bone by bone in place transforms shared points twice.
+- **Segment bones are named like `DEF-forearm.L.001`.** Detect the side with `".L" in name`-style logic on the base name, not `name.endswith(".L")`.
+- **Drivers on `hide_render`/`hide_viewport` stop evaluating** once the object is hidden, and **go stale after a regeneration**. To toggle a variant (backpack on or off), drive `show_viewport`/`show_render` of a Geometry Nodes modifier whose group outputs nothing, and recreate those drivers after every regeneration.
+- **Never non-uniformly scale through a band that crosses a face or jaw.** To change proportions, scale whole regions rigidly and blend only through simple geometry, like the neck.
+
+### Work in the user's live Blender, not in headless scripts
+
+The user's standing rule: character work goes through the Blender MCP in their open Blender, where they can watch each change land and the result is saved in the `.blend`. A day of headless `blender -b --python` scripts produced rig and texture bugs they had to catch from renders, and scripts that had to be rebuilt every time. Only two things belong outside the live session: reading images, and the long final render (run the saved scene file with plain command-line Blender, no script, so their Blender stays free).
+
+- Check `get_addon_status` first. If Blender isn't reachable, tell the user how to start the server (N sidebar, BlenderMCP tab, Start MCP Server) and **wait**. Don't start other work in the meantime; the user called that "jumping the gun".
+- **`look` fails under flatpak Blender** (it writes to `/tmp`, which the sandbox can't share). Render check images with `bpy.ops.render.render(write_still=True)` into a folder next to the `.blend`, then read the files. A Workbench render with cavity shading (`shading.show_cavity`, single colour) is the fastest way to see sculpted edges like a cap lip.
+- Make a `Lookdev` collection in the character file with the clip's sun and a check camera, and keep the world the clip uses. Judge the face under the lighting the audience will see.
+- Check renders set `scene.render.filepath`; set it back to the animation's output folder (`//frames/`) before the final save, or the command-line render writes 1,350 frames under the last check image's name.
+- Keep each `execute_blender_code` call under about 30 s (socket timeout). Build a 1,350-frame animation in one call (keyframe inserts are fast); render only a few check frames per call.
+- Blender 5: `action.fcurves` may not exist (layered actions); `scene.copy()` makes a linked copy (same objects, own render settings, camera and world).
+- `bpy.ops.wm.open_mainfile(filepath, use_scripts=True, load_ui=False)` works from inside an MCP call and the connection survives it, so the character file and the scene file can both be edited in one session (fix the character, save, reopen the scene). `use_scripts=True` avoids the Rigify UI script's "allow execution" dialog.
+- **Scene file as the asset.** Build the environment and the walk once in the live file and save it as the scene file. Add a second scene (`scene.copy()`, name it `Swag`, and set `use_fake_user = True` or the save drops it: a scene no window shows has zero users) for the merch still: exclude the environment collection in its view layer, link the sun into its master collection, give it its own camera, transparent film, 5000 × 5000, frame = the final pose. Then render both from the command line: `blender -b scene.blend -S Scene -a` and `blender -b scene.blend -S Swag -o //swag_#### -f 1350`. Same objects, lights and frame, so the merch still is provably the clip's character.
+- **Merch still (Fourthwall):** 5000 × 5000 PNG, RGBA, transparent film, character about 3,500–4,000 px tall. Check that semi-transparent pixels are under ~1% of the inked area (DTG prints a white underbase under any partial alpha).
+
+### Clean colour boundaries on a coarse generated mesh
+
+A decimated Hunyuan mesh has about 7 mm between vertices on the head. Any region painted per vertex (cap/hair, hair/skin, stubble) renders as a jagged, blocky line, and no amount of rule tweaking fixes that. Do this instead:
+
+- **Store signed distance fields, not colours.** For each boundary compute a per-vertex value in metres that is positive inside the region (`z - cap_edge_z`, `y - hairline_y`, an ellipse for the ears). It varies linearly across each face, so the shader's **Map Range (smoothstep, From −0.004 to 0.004)** on the Attribute node's `Fac` gives a clean per-pixel line. Combine regions with `min` (intersection) and `max` (union) before storing.
+- **Layer the head in the material:** skin → stubble (soft ±12 mm band whose top runs from the mouth corners back to just under the ear) → hair (side hair plus a fringe region under the brim) → ears (solid skin, override hair) → cap (over everything) → brim underside (cap × 0.62). Gate the whole head system with `z − neck_top` so the body keeps its vertex colours.
+- **Find the cap edge from the surface itself.** Per vertex, roughness = mean of (1 − n·n') over edge neighbours, one smoothing pass. The generated mesh sculpts hair as grooves (rough) and the cap as a smooth shell, so a table of mean roughness by angle-around-the-head and height shows the edge: ~1.48 at the sides, ~1.445 at the back, up to the brim root (~1.59) at the front for a 1.75 m figure. A single cap height was 6–8 cm too high at the back and read as "hair bleeding into the hat".
+- **The brim is cap by overhang, not height:** `max(z − cap_edge(angle), min(r − head_radius − 0.015, z − 1.52))`. Otherwise the drooping brim sides go hair-coloured, or the forehead under the brim goes orange.
+- **Hairline:** sideburn front edge ~4.5 cm in front of the ear's front edge, ending at the ear's middle height; skin under the lobe; behind the ear the hair bottom slopes from the lobe down to the nape; above the ear top the hairline sweeps forward toward the fringe (about 1.5 m forward per metre up); fringe = the band between the brows' top and the brim root at the front. Painting hair "behind the sideburn line" all the way down to the neck is what wrapped hair under the ear lobes.
+- **Gate the sheet projection off wherever the fields say hair** (`factor × (1 − side_hair)`). With it on, the sheet's temple and sideburn pixels stretch across the side of the head in blocky patches.
+- **Fade the projection out earlier** on surfaces turning sideways (−normal.y from 0.45 to 0.80, looser for the mid-face) so the brows aren't dragged along the temple. Shift the cheek UVs about 2 cm inward only on the cheeks (|x| beyond the eyes, below the brow line); shifting the fringe too misaligns the strands.
+- **Flat side skin, from a cheek patch.** Median of the sheet below the eyes and inside the face outline (for a 1.75 m figure: |x| 0.095–0.135, z 1.39–1.42). Not a per-height lookup along the face edge: that sweeps the eye white and the teeth across the side of the face as stripes. Stubble = 60% skin + 40% of the sheet's jaw sample; the first 45% hair mix read as grey.
+- **Specular makes faces grey.** Principled's default specular reflects the sky at grazing angles, so the sides of the face and the chin desaturate. Set `Specular IOR Level` ≈ 0.15 and roughness ≈ 0.65 on the character material. The user saw this as "weird lighting around the jaw" and "grey on the chin and sides".
+
+### Clothes and boots are separate objects
+
+A generated character comes as one merged shell. Split the boots off (faces entirely below the pant hem, found with a Workbench cavity render; here z < 0.242 on a 1.75 m figure) into their own objects, extrude their top rim 6 cm up and 15% inward so it hides inside the pant leg, and give each boot its own Armature modifier: sole and toe on `DEF-foot`, shaft on `DEF-shin.001`, with a **sharp 3.5 cm crease at the ankle**. The pant leg below the knee goes fully on the lower shin so the hem never follows the foot. Because boot and trouser share no vertices nothing shears, and the boot flexes at the ankle like a real one. A boot parented rigidly to the foot bone pokes through the hem as soon as the foot tilts 30°, so don't do that for a shaft this tall.
+
+### Eyes: measure before you move anything
+
+- Print a per-pixel classification row across each eye (white / dark / orange / skin) and read the iris and opening extents off it. Bounding boxes of colour masks lie: the dark eye outline and the lids merge with the iris. On this sheet both irises sat hard against the inner corner, 10 px off centre, which is what reads as cross-eyed.
+- Move each iris as a full disk (rim included, radius measured from the row data) by the offset that centres it in the opening, and fill the vacated strip row by row with the pixel just outside the disk on the **outer** side (white mid-eye, lid colour at the top and bottom rows). Fills from the far side pick up highlights and show as a crescent; partial-disk moves leave rim slivers; radial warps stretch the rim. Keep the corrected sheet as a separate file and point the texture node at it.
+- Never shift UVs anywhere near the eyes: a 2 cm cheek shift dragged the eye whites onto the temples.
+
+### Bangs under a cap brim
+
+A planar projection paints the sheet's brim onto the forehead behind it, so orange lands between the fringe strands. Switch the projection off in the fringe region and paint it flat hair colour, with the bottom edge traced from the sheet: per column, the lowest dark pixel (luminance < 0.2) scanning upward from **above the eyebrows**. Measure where the brows really are first (here z 1.53 to 1.56, directly under the bangs); a scan floor inside the brow band paints the brows as hair and they vanish.
+
+### Select body parts by bone weights, never by a position box
+
+A box "x beyond 0.12, z 0.35 to 0.95" meant to catch the arms also contains both legs, and the hand plane then painted the shins skin-coloured. Pick arm vertices as summed `DEF-upper_arm/forearm/hand` weight above 0.2 on the right side of the body, then apply geometric rules (a cuff plane across the wrist) inside that set.
+
+### Never call `animation_data_clear()` on a Rigify rig
+
+It deletes the rig's **drivers** along with the keys. Every switch on the rig then silently stops working: IK/FK, IK stretch, pole vector, all of them, and nothing warns you. Symptom here: `IK_Stretch = 0` and `pole_vector = True` had no effect and the knees kept bending backward. To drop old keys, unassign or replace the action (`rig.animation_data.action = None`). If the drivers are already gone, regenerate from the metarig (`rigify_generate` with the metarig active and `data.rigify_target_rig` set); that restores them but also clears the action and the custom properties, so re-key the animation and reset `IK_FK`, `IK_Stretch`, `pole_vector` afterwards. Set `rigify_parameters.bbones = 1` on the metarig's limb bones first so the regenerated DEF bones are straight.
+
+### Knees: check the bend direction numerically
+
+For each frame of interest print the knee's position relative to the hip-to-ankle line (here `knee.y - (hip.y + ankle.y)/2`, negative = in front for a character facing -Y). A positive number with a bent knee means it bends backward. A knee offset of 4 cm in the metarig was not enough on a mesh whose shin leans forward, so the rest knee ended up behind the chord and the IK picked the wrong direction. Fix in pose, not by moving the joint off the mesh: `thigh_parent["pole_vector"] = True` and put `thigh_ik_target` well in front of the knee (60 cm) in armature space, keyed once.
+
+### Measure heights from the mesh and the sheet before writing a boundary rule
+
+Print, per 5 mm of height along the centre column, the mesh vertex count, radius and mean normal.z, next to the sheet's colour at the same height. That table showed the forehead to z 1.575, sculpted bang strands at 1.58 to 1.622, a flat downward-facing brim underside at 1.625 to 1.64 (matching the sheet's brim edge at 1.63), and brows at 1.535 to 1.565. Three earlier guesses at the cap boundary (1.505, 1.588, "by radius") each painted the strands orange or the brows as hair. Also classify pixels along a line across each boundary in the render (cap / hair / skin / cloth per row) and read the transition width in pixels; a blend of 8 mm reads as "bleed" at 5000 px.
+
+### Crisp boundaries, one plane, in the shader
+
+Threshold every field in the shader with a 1 to 3 mm smoothstep, never 8 to 24 mm. Where a texture hands over to a flat colour (cuff to hand), switch both the texture and the colour at the **same** field in the shader (`factor *= 1 - S(f_hand)`), not with a separate per-vertex mask: a per-vertex mask ramps over a whole face (7 mm) and the vertex colours underneath show through as a muddy band.
+
+### Weights across a joint must blend, even on trousers
+
+Assigning everything below the knee to one shin bone with a hard cut at the knee height produced dark triangular shards around the pant hem as soon as the knee bent 7°: faces across the cut shear because one side follows the thigh and the other the shin. Blend thigh to shin over about ±4 cm around the knee (smoothstep), and keep the boot on the separate boot object. Check a posed close-up of the hem from the front with the boots hidden to tell a weight fault from a boot fault.
+
+### Frame the merch still from the character's real position
+
+Place the still camera from the rig's evaluated transform in the still's own scene (`scene.view_layers[0].depsgraph`, after `scene.frame_set`), not from `rig.matrix_world`, which reflects the active scene at its own frame. Then verify the framing by measuring the rendered alpha: top and bottom margins both positive, figure height about 1.75 m worth of pixels. An 85 mm lens at 4.6 m only covers 1.95 m vertically on a square frame, so a target at z 1.25 cut the boots off; 70 mm aimed at z 0.9 from z 1.25 fits the whole figure with margins.
+
+### Rigify knee pole: fix the rest pose, don't move the pole
+
+If the fitted rest knee sits behind the hip-to-ankle line (print `knee.y - chord_y`; here it was 1.6 cm behind because the generated shin leans forward over a big boot), the IK bends knees backward without a pole, and Rigify places its pole control behind the leg. Turning `pole_vector` on and moving the pole in front of the knee "fixes" the bend direction but **twists the whole leg about its long axis** (pole angle is fixed at -90°). The mesh below the knee swings sideways and the trouser hem flaps out behind the leg. Fix at the source: in the metarig put the knee 1.5-2 cm in front of the hip-ankle chord, regenerate onto the same rig, and leave `pole_vector` off. Keep the walk: set `use_fake_user` on the action before `rigify_generate` (it clears animation data), then reassign the action (and the slot in Blender 5) and reset the custom properties (`IK_FK`, `IK_Stretch`).
+
+Diagnose twist by colouring each vertex by its dominant deform bone (a FLOAT_COLOR attribute, Workbench, `color_type = "VERTEX"`) and rendering the walk frame. If the trouser (shin) and the boot shaft (lower shin) point different ways, the bones are twisted or out of reach. Numbers to print per frame: angle between the shin's and the foot's side axes (compare to rest), knee position relative to the chord, hip-to-IK-target distance against the chain length.
+
+### Keying child bones in armature space needs the parent evaluated first
+
+`pose_bone.matrix = M` converts M to the bone's local basis using the parent's pose **from the last depsgraph update**. Setting the torso and then the hips/chest/head in the same frame without `view_layer.update()` between them used the previous frame's torso, so the hip joint ended up 2.6 cm high and the legs over-reached. Key in hierarchy order: parent, `view_layer.update()`, children (reset their basis first, then rotate relative to the evaluated matrix), update, grandchildren. With mesh armature modifiers switched off during keying, 1,350 frames take about 15 s.
+
+### Centre the step under the hip
+
+The fitted rest ankle sat 7 cm in front of the hip joint. A step cycle centred on the rest ankle always lands the front foot 7 cm further forward than intended. Offset the walking foot positions back by about 80% of `hip.y - ankle.y` (scaled by the walk amplitude so the end pose is the sheet's). Then scan every frame: distance from `ORG-thigh` head to `MCH-thigh_ik_target` must stay under the chain length. Any frame above it stretches the lower shin, and the boot slides away from the trouser hem.
+
+### GPU attribute limit: pack scalar fields
+
+A material that reads more than about 14 vertex attributes (each Attribute node name, the colour attribute, the UV map, Generated coordinates) fails to compile in EEVEE and renders **magenta**, with no error in the log. Adding Generated coordinates for a procedural texture pushed the Wade material over. Pack scalar fields three per FLOAT_COLOR attribute (`pk_a` = cap, side hair, fringe ...), read them with one Attribute node's Vector output plus Separate XYZ, and keep a repack function to rerun after any field changes.
+
+### Soft cast shadows in EEVEE (Blender 5)
+
+A sun's `angle` only softens shadows when `use_shadow_jitter` is on. Without it the cap brim cast a hard horizontal line across the forehead. The sheet has that shadow painted as a gradient. Set jitter on, `shadow_filter_radius` about 3, angle about 20°. To prove a line is a shadow, render once with `light.use_shadow = False` and compare a pixel column.
+
+### Stubble round the jaw
+
+The projected sheet stubble ends where the jaw turns away; a flat colour there reads as a smooth pink patch. Use a procedural layer in the stubble region: Voronoi F1 distance (3D, Generated coordinates scaled to metres by the mesh dimensions, scale about 340) mapped to small dots, density varied by a noise texture, dot colour about 30% darker than the sheet's measured stubble median. Include the jaw underside: select skin-toned vertex colours facing down below the head line, not a height box (the hood collar sits at the same height).
+
+### Walk cycle: ankles
+
+- **Rigify limb DEF bones are 10-segment bendy bones.** The lower shin curves toward the foot, so a boot shaft bends like rubber at every step. Set `bbone_segments = 1` on `DEF-thigh*`, `DEF-shin*`, `DEF-upper_arm*`, `DEF-forearm*`.
+- **Step length must fit the legs.** 0.56 m legs with a 0.6 m step needed IK stretch to reach, which made the legs rubbery and dragged the boots. Set `IK_Stretch = 0` on `thigh_parent.*` and keep the step near 0.45 × leg length (speed 0.9 m/s, 32-frame cycle here). Gait references: the body is lowest just after contact (the "down" pose) and highest at passing; the foot slaps down in the first 10% of the cycle, the ankle dorsiflexes to 5–15° after heel lift, then plantarflexes quickly for push-off.
+- **Use the foot-roll control, `foot_heel_ik.<side>`.** +X rolls onto the ball (ankle rises and moves forward, toes stay planted); −X rocks onto the heel (toe up). Keep `foot_ik` at its rest rotation and on the ground through the stance; let the roll do the ankle. Per cycle fraction p: heel strike −14° at p = 0 easing to 0 by 0.10, flat to 0.40, 0 → +32° by toe-off at 0.60, back to 0 by 0.78, then to −14° by 1.0 for the next strike. Without the roll the foot stays flat until it leaves the ground and the shin leans 45° over it, which is what "ankles bending in odd ways" meant.
+- Check it with a side view of the feet at six frames across one cycle and a front three-quarter at three; the heel-up push-off should be visible on the rear foot.
+
+### Before telling the user it's done
+
+Put a frame from the on-screen clip next to the merch render and ask: **is that the same character, yes or no?** Also check close-ups of the face from front, three-quarter and side, both hands, the back, and a side view of the walk. The user will spot each of those defects in seconds.
